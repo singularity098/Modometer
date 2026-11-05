@@ -1,8 +1,8 @@
-# MIDI Counter
+# Modometer
 
 A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
 
-![MIDI Counter](docs/images/counter.png)
+![Modometer](docs/images/counter.png)
 
 - Counts every MIDI note-on, per **profile** ("Drums" in one instance, "Keys" in another).
 - **One hit, one count**: e-drum pads often send a burst of notes for one strike (double triggers).
@@ -27,7 +27,7 @@ your playing, put it in the track's **Input FX**, not the normal FX chain:
 
 1. Open the track's **Input FX** chain: in the mixer, click **IN FX** above the track's FX slots
    (right-clicking the FX button on the track panel also offers it).
-2. Add **MIDI Counter (Kaia)**.
+2. Add **Modometer (Kaia)**.
 3. Record-arm the track with record monitoring on, as you would to play live.
 
 Input FX only see the live input, so playback is never counted. Put your instrument in the normal FX
@@ -56,8 +56,8 @@ The stats view's notes panel has a **Drums** tab with hits per named drum (unnam
 
 Every push is built and tested by GitHub Actions. To get a build without compiling: open the
 repository's **Actions** tab, pick the latest **Build** run, and download the
-`MIDI-Counter-vst3-linux-…` artifact at the bottom. Unzip it and copy `MIDI-Counter.vst3` into
-`~/.vst3` (delete an older `MIDI Counter.vst3` there, if any). It needs glibc 2.35 or newer (Ubuntu 22.04 and later, and most current distros).
+`Modometer-vst3-linux-…` artifact at the bottom. Unzip it and copy `Modometer.vst3` into
+`~/.vst3` (delete an older `Modometer.vst3`, or `MIDI-Counter.vst3` from before the rename, there, if any). It needs glibc 2.35 or newer (Ubuntu 22.04 and later, and most current distros).
 
 To build it yourself you need Rust (stable); X11 and OpenGL are loaded at run time.
 
@@ -65,14 +65,14 @@ To build it yourself you need Rust (stable); X11 and OpenGL are loaded at run ti
 ./scripts/bundle.sh --install
 ```
 
-This builds `target/bundle/MIDI-Counter.vst3` and copies it to `~/.vst3`, removing an older
-`MIDI Counter.vst3`. Rescan plugins in Reaper. The plugin is still called "MIDI Counter" there.
+This builds `target/bundle/Modometer.vst3` and copies it to `~/.vst3`, replacing an older
+build (and removing `MIDI-Counter.vst3` from before the rename). Rescan plugins in Reaper.
 
 ## Your data
 
-Counts are saved in `~/.local/share/midi-counter/profiles/<profile>/` (or under `$XDG_DATA_HOME`).
+Counts are saved in `~/.local/share/modometer/profiles/<profile>/` (or under `$XDG_DATA_HOME`).
 `.local` is a hidden folder: press Ctrl+H in your file manager to see it. To keep the data in a
-synced folder, move that `midi-counter` folder there and symlink it back.
+synced folder, move that `modometer` folder there and symlink it back.
 
 Each profile's folder holds its month logs, `totals.cache`, and `settings.txt` (drum names and the
 retrigger guard):

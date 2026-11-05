@@ -21,11 +21,11 @@ use vst3::{uid, Class, ComRef, ComWrapper};
 use crate::session::{Guard, Shared};
 use crate::store::{self, Store};
 
-pub const PLUGIN_NAME: &str = "MIDI Counter";
+pub const PLUGIN_NAME: &str = "Modometer";
 pub const VENDOR: &str = "Kaia";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const URL: &str = "https://github.com/singularity098/midi-counter";
-const STATE_MAGIC: &[u8] = b"MIDICOUNTER1\n";
+const URL: &str = "https://github.com/singularity098/modometer";
+const STATE_MAGIC: &[u8] = b"MODOMETER1\n";
 
 pub fn copy_cstring(src: &str, dst: &mut [c_char]) {
     let n = src.len().min(dst.len().saturating_sub(1));
@@ -49,7 +49,7 @@ pub fn copy_wstring(src: &str, dst: &mut [TChar]) {
     }
 }
 
-pub struct MidiCounter {
+pub struct Modometer {
     shared: Arc<Shared>,
     sample64: Cell<bool>,
     // Audio thread only: the retrigger guard, a sample clock and the sample rate.
@@ -60,18 +60,19 @@ pub struct MidiCounter {
 
 // The host calls the controller and processor parts from its own threads as the VST3 threading
 // rules allow; the only state shared between threads lives in `Shared`, which is Sync.
-unsafe impl Send for MidiCounter {}
-unsafe impl Sync for MidiCounter {}
+unsafe impl Send for Modometer {}
+unsafe impl Sync for Modometer {}
 
-impl Class for MidiCounter {
+impl Class for Modometer {
     type Interfaces = (IComponent, IAudioProcessor, IProcessContextRequirements, IEditController);
 }
 
-impl MidiCounter {
+impl Modometer {
+    // Kept from when the plugin was called MIDI Counter, so existing projects still load it.
     pub const CID: TUID = uid(0x4D494449, 0x4B616961, 0x436F756E, 0x74657231);
 
-    pub fn new() -> MidiCounter {
-        MidiCounter {
+    pub fn new() -> Modometer {
+        Modometer {
             shared: Shared::new(Store::new(store::default_root())),
             sample64: Cell::new(false),
             guard: RefCell::new(Guard::default()),
@@ -85,13 +86,13 @@ impl MidiCounter {
     }
 }
 
-impl Default for MidiCounter {
+impl Default for Modometer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl IPluginBaseTrait for MidiCounter {
+impl IPluginBaseTrait for Modometer {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
         self.shared.start();
         kResultOk
@@ -117,7 +118,7 @@ unsafe fn read_stream(stream: *mut IBStream, max: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-impl IComponentTrait for MidiCounter {
+impl IComponentTrait for Modometer {
     unsafe fn getControllerClassId(&self, _class_id: *mut TUID) -> tresult {
         // Single component: the controller is this object.
         kNotImplemented
@@ -212,7 +213,7 @@ impl IComponentTrait for MidiCounter {
     }
 }
 
-impl IAudioProcessorTrait for MidiCounter {
+impl IAudioProcessorTrait for Modometer {
     unsafe fn setBusArrangements(
         &self,
         inputs: *mut SpeakerArrangement,
@@ -316,13 +317,13 @@ impl IAudioProcessorTrait for MidiCounter {
     }
 }
 
-impl IProcessContextRequirementsTrait for MidiCounter {
+impl IProcessContextRequirementsTrait for Modometer {
     unsafe fn getProcessContextRequirements(&self) -> u32 {
         0
     }
 }
 
-impl IEditControllerTrait for MidiCounter {
+impl IEditControllerTrait for Modometer {
     unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
         kResultOk
     }
@@ -407,7 +408,7 @@ impl IPluginFactoryTrait for Factory {
         if index != 0 {
             return kInvalidArgument;
         }
-        info.cid = MidiCounter::CID;
+        info.cid = Modometer::CID;
         info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as int32;
         copy_cstring("Audio Module Class", &mut info.category);
         copy_cstring(PLUGIN_NAME, &mut info.name);
@@ -415,10 +416,10 @@ impl IPluginFactoryTrait for Factory {
     }
 
     unsafe fn createInstance(&self, cid: FIDString, iid: FIDString, obj: *mut *mut c_void) -> tresult {
-        if cid.is_null() || obj.is_null() || *(cid as *const TUID) != MidiCounter::CID {
+        if cid.is_null() || obj.is_null() || *(cid as *const TUID) != Modometer::CID {
             return kInvalidArgument;
         }
-        let Some(instance) = ComWrapper::new(MidiCounter::new()).to_com_ptr::<FUnknown>() else {
+        let Some(instance) = ComWrapper::new(Modometer::new()).to_com_ptr::<FUnknown>() else {
             return kInvalidArgument;
         };
         let ptr = instance.as_ptr();
@@ -432,7 +433,7 @@ impl IPluginFactory2Trait for Factory {
         if index != 0 {
             return kInvalidArgument;
         }
-        info.cid = MidiCounter::CID;
+        info.cid = Modometer::CID;
         info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as int32;
         copy_cstring("Audio Module Class", &mut info.category);
         copy_cstring(PLUGIN_NAME, &mut info.name);

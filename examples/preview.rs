@@ -9,14 +9,14 @@
 //! cargo run --example preview -- --kit              # drums view
 //! cargo run --example preview -- --screenshot a.png # save the first frame and exit
 //! ```
-//! Data goes to a temporary folder unless MIDI_COUNTER_DATA_DIR is set.
+//! Data goes to a temporary folder unless MODOMETER_DATA_DIR is set.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use midi_counter::session::Shared;
-use midi_counter::store::{self, MinuteCounts, Store};
-use midi_counter::ui::{self, Editor, Options};
+use modometer::session::Shared;
+use modometer::store::{self, MinuteCounts, Store};
+use modometer::ui::{self, Editor, Options};
 
 fn fake_history(store: &Store, profile: &str) {
     if !store.months(profile).is_empty() {
@@ -58,9 +58,9 @@ fn main() {
     let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1)).map(Into::into);
     let start_in_stats = args.iter().any(|a| a == "--stats");
     let start_in_kit = args.iter().any(|a| a == "--kit");
-    let root = std::env::var_os("MIDI_COUNTER_DATA_DIR")
+    let root = std::env::var_os("MODOMETER_DATA_DIR")
         .map(Into::into)
-        .unwrap_or_else(|| std::env::temp_dir().join("midi-counter-preview"));
+        .unwrap_or_else(|| std::env::temp_dir().join("modometer-preview"));
     let store = Store::new(root);
     store.create_profile("Guitar").unwrap();
     store.create_profile("Drums").unwrap();
@@ -78,7 +78,7 @@ fn main() {
     // Pretend someone's playing: a little groove, with the odd double trigger.
     let player = Arc::clone(&shared);
     std::thread::spawn(move || {
-        let mut guard = midi_counter::session::Guard::default();
+        let mut guard = modometer::session::Guard::default();
         let start = std::time::Instant::now();
         let pattern = [36u8, 42, 38, 42, 36, 36, 38, 49];
         for i in 0.. {

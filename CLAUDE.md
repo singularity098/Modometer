@@ -5,7 +5,7 @@ convention or command changes, update it in the same commit.
 
 ## Project
 
-MIDI Counter: a VST3 plugin (Linux, Reaper) in Rust that counts every MIDI note played, per profile,
+Modometer: a VST3 plugin (Linux, Reaper) in Rust that counts every MIDI note played, per profile,
 forever, with stats. Vendor "Kaia". MIT.
 
 - **Requirements and decisions**: `docs/Requirements.md` is the source of truth; record new decisions
@@ -37,7 +37,7 @@ src/vst3/           VST3 factory and component (mod.rs), editor view embedding (
 examples/preview.rs     The window on its own with fake data; --stats, --kit, --screenshot <png>
 examples/embed_test.rs  Embeds the editor via IPlugView into a parent window, like a host; --resize
 tests/vst3_host.rs      Drives the plugin through its VST3 interfaces
-scripts/bundle.sh       Builds "MIDI-Counter.vst3" (--install copies to ~/.vst3)
+scripts/bundle.sh       Builds "Modometer.vst3" (--install copies to ~/.vst3)
 resources/fonts/        Jost (OFL)
 ```
 
@@ -46,9 +46,9 @@ resources/fonts/        Jost (OFL)
 - Test: `cargo test`
 - Bundle and install: `./scripts/bundle.sh --install`
 - CI: `.github/workflows/build.yml` tests and bundles every push on ubuntu-22.04 (glibc 2.35) and
-  uploads `MIDI-Counter.vst3` as an artifact. Keep it green.
+  uploads `Modometer.vst3` as an artifact. Keep it green.
 - Screenshots without a display:
   `xvfb-run -a -s "-screen 0 1024x768x24 +extension GLX" cargo run --example preview -- --stats --screenshot out.png`
-- `MIDI_COUNTER_DATA_DIR` overrides the data folder (tests and tools use it).
+- `MODOMETER_DATA_DIR` overrides the data folder (tests and tools use it).
 
 New source files start with `// SPDX-License-Identifier: MIT` and `// Copyright (c) 2026 singularity098`.

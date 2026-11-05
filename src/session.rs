@@ -288,7 +288,7 @@ impl Shared {
         self.apply_kit(&p.kit);
         let dir = self.store.profile_dir(&p.name);
         if let Err(e) = p.kit.save(&dir) {
-            eprintln!("MIDI Counter: couldn't save settings of {}: {e}", p.name);
+            eprintln!("Modometer: couldn't save settings of {}: {e}", p.name);
         }
         p.kit_mtime = settings_mtime(&dir);
         self.generation.fetch_add(1, Ordering::Relaxed);
@@ -365,7 +365,7 @@ impl Shared {
                     p.pending.clear();
                     p.pending_total = 0;
                 }
-                Err(e) => eprintln!("MIDI Counter: couldn't save {}: {e}", p.name),
+                Err(e) => eprintln!("Modometer: couldn't save {}: {e}", p.name),
             }
         }
         let before = p.saved_total + p.pending_total;
@@ -414,7 +414,7 @@ impl Shared {
         *self.stop.lock().unwrap() = false;
         let me = Arc::clone(self);
         let handle = std::thread::Builder::new()
-            .name("midi-counter-save".into())
+            .name("modometer-save".into())
             .spawn(move || me.saver_loop())
             .ok();
         *self.saver.lock().unwrap() = handle;
@@ -568,7 +568,7 @@ mod tests {
     use super::*;
 
     fn temp_store(tag: &str) -> Store {
-        let dir = std::env::temp_dir().join(format!("midi-counter-session-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("modometer-session-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Store::new(dir)
     }

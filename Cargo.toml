@@ -1,5 +1,5 @@
 [package]
-name = "midi_counter"
+name = "modometer"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

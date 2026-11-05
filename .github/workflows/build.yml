@@ -1,5 +1,5 @@
 # Builds and tests the plugin on every push and pull request, and uploads
-# "MIDI-Counter.vst3" as a downloadable artifact of the run.
+# "Modometer.vst3" as a downloadable artifact of the run.
 name: Build
 
 on:
@@ -27,6 +27,6 @@ jobs:
       - name: Upload the plugin
         uses: actions/upload-artifact@v4
         with:
-          name: MIDI-Counter-vst3-linux-${{ github.sha }}
+          name: Modometer-vst3-linux-${{ github.sha }}
           path: target/bundle/
           if-no-files-found: error

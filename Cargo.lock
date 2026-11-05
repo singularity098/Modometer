@@ -407,7 +407,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
 
 [[package]]
-name = "midi_counter"
+name = "modometer"
 version = "0.1.0"
 dependencies = [
  "baseview",

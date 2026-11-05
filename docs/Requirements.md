@@ -1,4 +1,4 @@
-# MIDI Counter: Requirements
+# Modometer: Requirements
 
 The owner's requirements (2026-11-05) and the decisions agreed since. This is the source of truth:
 record new decisions here.
@@ -34,10 +34,12 @@ record new decisions here.
 - **Velocity is tracked** (per minute, all 127 values).
 - **Same profile in two instances**: the counts add up.
 - **Background**: plain near-black, no image.
-- **Data location**: the normal app-data folder (`~/.local/share/midi-counter`); the owner will
+- **Data location**: the normal app-data folder (`~/.local/share/modometer`); the owner will
   symlink it into a synced folder.
-- **Name**: "MIDI Counter", developer/vendor "Kaia". On disk the bundle is `MIDI-Counter.vst3`
-  (with `MIDI-Counter.so` inside), no space (owner, 2026-11-05).
+- **Name**: "Modometer", developer/vendor "Kaia". On disk the bundle is `Modometer.vst3`
+  (with `Modometer.so` inside). Renamed from "MIDI Counter" (owner, 2026-11-05): crate `modometer`,
+  data folder `modometer`, `MODOMETER_DATA_DIR`. No migration of old data or saved plugin state (the
+  owner moves the files). The VST3 class ID is unchanged, so Reaper projects still find the plugin.
 - **Branch**: work on `main` and push there.
 
 ## Owner's requests and decisions (2026-11-05, after first use)
@@ -49,7 +51,7 @@ record new decisions here.
   only; old logs are not rewritten.
 - **Drum map.** Name notes per profile ("Snare", "Crash 2", custom names) with a **Learn** button.
   Notes with the same name (compared without case) are one drum, for the guard and in the stats.
-- **Where the data is**: unchanged (`~/.local/share/midi-counter`); the README now says `.local` is
+- **Where the data is**: unchanged (`~/.local/share/modometer`); the README now says `.local` is
   hidden and lists the files.
 
 ## Design
@@ -73,7 +75,7 @@ record new decisions here.
 Append-only text log per profile, one file per UTC month:
 
 ```
-~/.local/share/midi-counter/profiles/<profile>/2026-11.log
+~/.local/share/modometer/profiles/<profile>/2026-11.log
 2026-11-05T15:04Z 212 n36:40,38:22,42:150 v64:12,100:200
 ```
 

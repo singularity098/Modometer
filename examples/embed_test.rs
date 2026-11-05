@@ -51,8 +51,8 @@ fn main() {
     let id = rx.recv().expect("parent window id");
 
     unsafe {
-        let factory = ComPtr::from_raw(midi_counter::vst3::GetPluginFactory()).unwrap();
-        let cid = midi_counter::vst3::MidiCounter::CID;
+        let factory = ComPtr::from_raw(modometer::vst3::GetPluginFactory()).unwrap();
+        let cid = modometer::vst3::Modometer::CID;
         let mut obj = std::ptr::null_mut();
         use vst3::Interface;
         factory.createInstance(cid.as_ptr(), IComponent::IID.as_ptr() as FIDString, &mut obj);

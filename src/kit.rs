@@ -77,7 +77,7 @@ impl Kit {
 
     pub fn format(&self) -> String {
         let mut s = String::from(
-            "# MIDI Counter settings for this profile. The plugin rewrites this file when you change them.\n",
+            "# Modometer settings for this profile. The plugin rewrites this file when you change them.\n",
         );
         let _ = writeln!(s, "retrigger-ms {}", self.retrigger_ms);
         for (note, name) in &self.names {

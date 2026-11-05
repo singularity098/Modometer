@@ -92,7 +92,7 @@ fn note_off(pitch: i16) -> Event {
 }
 
 unsafe fn create(factory: &ComPtr<IPluginFactory>) -> ComPtr<IComponent> {
-    let cid = midi_counter::vst3::MidiCounter::CID;
+    let cid = modometer::vst3::Modometer::CID;
     let mut obj = ptr::null_mut();
     let r = factory.createInstance(cid.as_ptr(), IComponent::IID.as_ptr() as FIDString, &mut obj);
     assert_eq!(r, kResultOk);
@@ -101,12 +101,12 @@ unsafe fn create(factory: &ComPtr<IPluginFactory>) -> ComPtr<IComponent> {
 
 #[test]
 fn host_round_trip() {
-    let dir = std::env::temp_dir().join(format!("midi-counter-host-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("modometer-host-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::env::set_var("MIDI_COUNTER_DATA_DIR", &dir);
+    std::env::set_var("MODOMETER_DATA_DIR", &dir);
 
     unsafe {
-        let factory = ComPtr::from_raw(midi_counter::vst3::GetPluginFactory()).unwrap();
+        let factory = ComPtr::from_raw(modometer::vst3::GetPluginFactory()).unwrap();
         let mut info: PFactoryInfo = std::mem::zeroed();
         assert_eq!(factory.getFactoryInfo(&mut info), kResultOk);
         let vendor = std::ffi::CStr::from_ptr(info.vendor.as_ptr()).to_str().unwrap().to_string();
@@ -115,7 +115,7 @@ fn host_round_trip() {
         let f2 = factory.cast::<IPluginFactory2>().unwrap();
         let mut ci2: PClassInfo2 = std::mem::zeroed();
         assert_eq!(f2.getClassInfo2(0, &mut ci2), kResultOk);
-        assert_eq!(std::ffi::CStr::from_ptr(ci2.name.as_ptr()).to_str().unwrap(), "MIDI Counter");
+        assert_eq!(std::ffi::CStr::from_ptr(ci2.name.as_ptr()).to_str().unwrap(), "Modometer");
 
         let component = create(&factory);
         assert_eq!(component.initialize(ptr::null_mut()), kResultOk);
@@ -183,12 +183,12 @@ fn host_round_trip() {
         assert_eq!(component.terminate(), kResultOk);
         drop((processor, controller, component));
 
-        let store = midi_counter::store::Store::new(dir.clone());
+        let store = modometer::store::Store::new(dir.clone());
         let mut total = 0;
         let mut notes = Vec::new();
         let mut vels = Vec::new();
         for m in store.months("Default") {
-            midi_counter::store::scan_file(&store.month_path("Default", m), 0, true, |l| {
+            modometer::store::scan_file(&store.month_path("Default", m), 0, true, |l| {
                 total += l.total;
                 notes.extend_from_slice(&l.notes);
                 vels.extend_from_slice(&l.vels);
@@ -204,23 +204,23 @@ fn host_round_trip() {
         let component = create(&factory);
         component.initialize(ptr::null_mut());
         let s2 = ComWrapper::new(Stream::default());
-        *s2.data.borrow_mut() = b"MIDICOUNTER1\nDrums\n".to_vec();
+        *s2.data.borrow_mut() = b"MODOMETER1\nDrums\n".to_vec();
         let s2 = s2.to_com_ptr::<IBStream>().unwrap();
         assert_eq!(component.setState(s2.as_ptr()), kResultOk);
         let out = ComWrapper::new(Stream::default());
         let out_ptr = out.to_com_ptr::<IBStream>().unwrap();
         component.getState(out_ptr.as_ptr());
-        assert_eq!(out.data.borrow().as_slice(), b"MIDICOUNTER1\nDrums\n");
+        assert_eq!(out.data.borrow().as_slice(), b"MODOMETER1\nDrums\n");
 
         // The editor's size is kept with the state too.
         let s3 = ComWrapper::new(Stream::default());
-        *s3.data.borrow_mut() = b"MIDICOUNTER1\nDrums\nzoom 1.500\n".to_vec();
+        *s3.data.borrow_mut() = b"MODOMETER1\nDrums\nzoom 1.500\n".to_vec();
         let s3 = s3.to_com_ptr::<IBStream>().unwrap();
         assert_eq!(component.setState(s3.as_ptr()), kResultOk);
         let out = ComWrapper::new(Stream::default());
         let out_ptr = out.to_com_ptr::<IBStream>().unwrap();
         component.getState(out_ptr.as_ptr());
-        assert_eq!(out.data.borrow().as_slice(), b"MIDICOUNTER1\nDrums\nzoom 1.500\n");
+        assert_eq!(out.data.borrow().as_slice(), b"MODOMETER1\nDrums\nzoom 1.500\n");
         let controller = component.cast::<IEditController>().unwrap();
         let view = ComPtr::from_raw(controller.createView(c"editor".as_ptr())).unwrap();
         assert_eq!(view.canResize(), kResultTrue);

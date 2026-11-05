@@ -44,7 +44,7 @@ pub fn window_settings(scale: f64) -> Vec<WindowSettings> {
     let w = (WIDTH as f64 * scale).round() as u32;
     let h = (HEIGHT as f64 * scale).round() as u32;
     let base = WindowSettings::new()
-        .with_title("MIDI Counter")
+        .with_title("Modometer")
         .with_size(baseview::dpi::PhysicalSize::new(w, h))
         .with_resizable(true);
     [Some(4), None]

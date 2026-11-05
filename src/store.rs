@@ -233,9 +233,9 @@ pub fn scan_file(path: &Path, from: u64, detail: bool, mut f: impl FnMut(&Line))
 
 // ---- Store and profiles ----
 
-/// The data folder: `$XDG_DATA_HOME/midi-counter`, else `~/.local/share/midi-counter`.
+/// The data folder: `$XDG_DATA_HOME/modometer`, else `~/.local/share/modometer`.
 pub fn default_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("MIDI_COUNTER_DATA_DIR") {
+    if let Some(dir) = std::env::var_os("MODOMETER_DATA_DIR") {
         return PathBuf::from(dir);
     }
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -243,7 +243,7 @@ pub fn default_root() -> PathBuf {
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("midi-counter")
+    base.join("modometer")
 }
 
 #[derive(Clone)]
@@ -391,7 +391,7 @@ mod tests {
     use super::*;
 
     fn temp_store(tag: &str) -> Store {
-        let dir = std::env::temp_dir().join(format!("midi-counter-test-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("modometer-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         Store::new(dir)
     }

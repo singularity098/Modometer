@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn buckets_cover_the_range() {
-        let store = Store::new(std::env::temp_dir().join("midi-counter-stats-none"));
+        let store = Store::new(std::env::temp_dir().join("modometer-stats-none"));
         for span in SPANS {
             for &bucket in span.buckets() {
                 let s = compute(&store, "nobody", Query { span, offset: -1, bucket }, &BTreeMap::new());
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn counts_land_in_the_right_bucket() {
-        let dir = std::env::temp_dir().join(format!("midi-counter-stats-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("modometer-stats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.clone());
         store.create_profile("P").unwrap();
