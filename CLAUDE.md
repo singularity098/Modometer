@@ -44,6 +44,8 @@ resources/fonts/        Jost (OFL)
 
 - Test: `cargo test`
 - Bundle and install: `./scripts/bundle.sh --install`
+- CI: `.github/workflows/build.yml` tests and bundles every push on ubuntu-22.04 (glibc 2.35) and
+  uploads `MIDI Counter.vst3` as an artifact. Keep it green.
 - Screenshots without a display:
   `xvfb-run -a -s "-screen 0 1024x768x24 +extension GLX" cargo run --example preview -- --stats --screenshot out.png`
 - `MIDI_COUNTER_DATA_DIR` overrides the data folder (tests and tools use it).

@@ -29,7 +29,12 @@ chain as usual. Each instance has its own profile, saved with the project.
 
 ## Building and installing
 
-You need Rust (stable) and the X11/OpenGL development basics your distribution ships.
+Every push is built and tested by GitHub Actions. To get a build without compiling: open the
+repository's **Actions** tab, pick the latest **Build** run, and download the
+`MIDI-Counter-vst3-linux-…` artifact at the bottom. Unzip it and copy `MIDI Counter.vst3` into
+`~/.vst3`. It needs glibc 2.35 or newer (Ubuntu 22.04 and later, and most current distros).
+
+To build it yourself you need Rust (stable); X11 and OpenGL are loaded at run time.
 
 ```bash
 ./scripts/bundle.sh --install
