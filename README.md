@@ -5,6 +5,10 @@ A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
 ![MIDI Counter](docs/images/counter.png)
 
 - Counts every MIDI note-on, per **profile** ("Drums" in one instance, "Keys" in another).
+- **One hit, one count**: e-drum pads often send a burst of notes for one strike (double triggers).
+  A retrigger guard counts repeats of the same drum within 30 ms once (adjustable per profile).
+- **Drum map**: name your pads ("Snare", "Crash 2", anything) with **Learn**, per profile, and see
+  hits per drum in the stats.
 - Changes nothing: audio passes through bit for bit, and MIDI goes on to the next plugin untouched.
 - **Stats**: notes per minute, hour, day, week, month or year over any hour, day, week, month or year
   (or all time); which notes you play most (by pitch class or by note, with General MIDI drum names),
@@ -27,6 +31,25 @@ your playing, put it in the track's **Input FX**, not the normal FX chain:
 Input FX only see the live input, so playback is never counted. Put your instrument in the normal FX
 chain as usual. Each instance has its own profile, saved with the project.
 
+## Drums: names, Learn and the retrigger guard
+
+![Drums](docs/images/drums.png)
+
+Click **Drums** on the counter screen.
+
+- **Learn**: press it, hit a pad, then type a name or pick one (Kick, Snare, Crash 2, …) and Save.
+  You can also click any line under **Recent hits** to name that note, or a named drum to rename or
+  remove it. Give several notes the same name (say the snare's head and rim) to count them as one
+  drum. Names belong to the profile.
+- **Recent hits** shows every note-on that arrives: note, name, velocity, and the time since the
+  same drum's last note. Hits the guard dropped show as *ignored*. If one strike of a pad shows
+  several lines, that's what your module is sending.
+- **Retrigger guard**: hits of the same drum closer together than this count once. 30 ms by default
+  (Off, 10–150 ms). Real strokes on one drum are rarely closer than 40–50 ms; e-drum double triggers
+  usually come within 5–20 ms.
+
+The stats view's notes panel has a **Drums** tab with hits per named drum (unnamed notes as Other).
+
 ## Building and installing
 
 Every push is built and tested by GitHub Actions. To get a build without compiling: open the
@@ -45,7 +68,20 @@ This builds `target/bundle/MIDI Counter.vst3` and copies it to `~/.vst3`. Rescan
 ## Your data
 
 Counts are saved in `~/.local/share/midi-counter/profiles/<profile>/` (or under `$XDG_DATA_HOME`).
-To keep them in a synced folder, move that `midi-counter` folder there and symlink it back.
+`.local` is a hidden folder: press Ctrl+H in your file manager to see it. To keep the data in a
+synced folder, move that `midi-counter` folder there and symlink it back.
+
+Each profile's folder holds its month logs, `totals.cache`, and `settings.txt` (drum names and the
+retrigger guard):
+
+```
+retrigger-ms 30
+note 36 Kick
+note 38 Snare
+```
+
+The plugin rewrites `settings.txt` when you change something in the Drums view, and picks up edits
+made by hand within 30 seconds.
 
 Each month is one small text file you can read or back up, one line per minute you played:
 
@@ -66,8 +102,8 @@ cargo test
 cargo run --example preview
 ```
 
-`preview` opens the window on its own with made-up data (`--stats` to start on the stats view,
-`--screenshot file.png` to save a frame and exit). `embed_test` embeds the editor into a parent
+`preview` opens the window on its own with made-up data (`--stats` or `--kit` to start on the stats
+or drums view, `--screenshot file.png` to save a frame and exit). `embed_test` embeds the editor into a parent
 window through the VST3 view interface, as a host does.
 
 ## License

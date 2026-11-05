@@ -3,6 +3,7 @@
 
 //! MIDI Counter: a VST3 plugin that counts every MIDI note played, per profile, forever.
 
+pub mod kit;
 pub mod session;
 pub mod stats;
 pub mod store;

@@ -6,6 +6,7 @@
 //! It draws only when something changed: a 30 Hz timer checks one atomic counter for new hits,
 //! and mouse movement redraws only when what's under the mouse changes.
 
+mod kit;
 pub mod theme;
 
 use std::cell::RefCell;
@@ -22,6 +23,7 @@ use femtovg::renderer::OpenGl;
 use femtovg::{Align, Baseline, Canvas, Color, FontId, Paint, Path};
 use keyboard_types::{Key, KeyState, NamedKey};
 
+use crate::kit::{Kit, RETRIGGER_CHOICES};
 use crate::session::{Shared, Snapshot};
 use crate::stats::{self, Bucket, Query, Span, Stats};
 use theme::{commas, WithAlpha, HEIGHT, WIDTH};
@@ -32,6 +34,8 @@ pub struct Options {
     pub screenshot: Option<PathBuf>,
     /// Open on the stats view (for the preview tool).
     pub start_in_stats: bool,
+    /// Open on the drums view (for the preview tool).
+    pub start_in_kit: bool,
 }
 
 /// Window settings to try, best first: multisampled, then plain (some drivers and virtual displays
@@ -83,7 +87,15 @@ enum Action {
     Bucket(Bucket),
     Prev,
     Next,
-    NoteMode(bool),
+    NoteMode(NoteMode),
+    ShowKit,
+    Learn,
+    /// Open the naming dialog for a note.
+    PickNote(u8),
+    Preset(&'static str),
+    SaveDrum,
+    RemoveDrum(u8),
+    Retrigger(i32),
     /// Swallows clicks on a panel.
     None,
 }
@@ -92,12 +104,24 @@ enum Action {
 enum View {
     Counter,
     Stats,
+    Kit,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NoteMode {
+    PitchClass,
+    All,
+    Drums,
 }
 
 enum Overlay {
     None,
     Profiles { scroll: usize },
     NewProfile { text: String, error: Option<String> },
+    /// Waiting for a hit; `since` is the monitor's sequence number when Learn was pressed.
+    Learn { since: u32 },
+    /// Naming `note`. `edited` once the user typed or picked a name.
+    NameDrum { note: u8, text: String, edited: bool, error: Option<String> },
 }
 
 struct Ui {
@@ -118,7 +142,10 @@ struct Ui {
     stats: Option<Stats>,
     incoming: Arc<Mutex<Option<Stats>>>,
     loading: bool,
-    all_notes: bool,
+    note_mode: NoteMode,
+    kit: Kit,
+    kit_scroll: usize,
+    seen_recent: u32,
     screenshot_done: bool,
 }
 
@@ -151,7 +178,13 @@ impl Editor {
         let snapshot = shared.snapshot();
         let span = Span::Week;
         let ui = Ui {
-            view: if options.start_in_stats { View::Stats } else { View::Counter },
+            view: if options.start_in_stats {
+                View::Stats
+            } else if options.start_in_kit {
+                View::Kit
+            } else {
+                View::Counter
+            },
             overlay: Overlay::None,
             mouse: (-1.0, -1.0),
             regions: Vec::new(),
@@ -165,7 +198,10 @@ impl Editor {
             stats: None,
             incoming: Arc::new(Mutex::new(None)),
             loading: false,
-            all_notes: false,
+            note_mode: NoteMode::PitchClass,
+            kit: shared.kit(),
+            kit_scroll: 0,
+            seen_recent: shared.recent_seq(),
             screenshot_done: false,
         };
         let editor = Editor {
@@ -252,7 +288,45 @@ impl Editor {
                 ui.query.offset = (ui.query.offset + 1).min(0);
                 self.load_stats(ui);
             }
-            Action::NoteMode(all) => ui.all_notes = all,
+            Action::NoteMode(mode) => ui.note_mode = mode,
+            Action::ShowKit => ui.view = View::Kit,
+            Action::Learn => {
+                ui.overlay = Overlay::Learn { since: self.shared.recent_seq() };
+            }
+            Action::PickNote(note) => {
+                let text = ui.kit.name(note).unwrap_or("").to_string();
+                ui.overlay = Overlay::NameDrum { note, edited: !text.is_empty(), text, error: None };
+                let _ = self.ctx.focus();
+            }
+            Action::Preset(name) => {
+                if let Overlay::NameDrum { text, edited, error, .. } = &mut ui.overlay {
+                    *text = name.to_string();
+                    *edited = true;
+                    *error = None;
+                }
+            }
+            Action::SaveDrum => self.save_drum(ui),
+            Action::RemoveDrum(note) => {
+                let _ = self.shared.set_drum_name(note, None);
+                ui.kit = self.shared.kit();
+                if matches!(ui.overlay, Overlay::NameDrum { .. }) {
+                    ui.overlay = Overlay::None;
+                }
+            }
+            Action::Retrigger(dir) => {
+                let ms = ui.kit.retrigger_ms;
+                let i = RETRIGGER_CHOICES.iter().position(|&c| c >= ms).unwrap_or(RETRIGGER_CHOICES.len() - 1);
+                // `i` is the first choice >= ms (ms may be an in-between value edited by hand).
+                let i = if dir < 0 {
+                    i.saturating_sub(1)
+                } else if RETRIGGER_CHOICES[i] > ms {
+                    i
+                } else {
+                    (i + 1).min(RETRIGGER_CHOICES.len() - 1)
+                };
+                self.shared.set_retrigger_ms(RETRIGGER_CHOICES[i]);
+                ui.kit = self.shared.kit();
+            }
             Action::None => {}
         }
     }
@@ -269,6 +343,39 @@ impl Editor {
                 }
                 Err(e) => *error = Some(e),
             }
+        }
+    }
+
+    fn save_drum(&self, ui: &mut Ui) {
+        if let Overlay::NameDrum { note, text, error, .. } = &mut ui.overlay {
+            match self.shared.set_drum_name(*note, Some(text)) {
+                Ok(()) => {
+                    ui.overlay = Overlay::None;
+                    ui.kit = self.shared.kit();
+                }
+                Err(e) => *error = Some(e),
+            }
+        }
+    }
+
+    /// A note-on arrived while learning or naming: (re)target the dialog at it.
+    fn on_recent_hit(&self, ui: &mut Ui) {
+        let Some(hit) = self.shared.recent_hits().first().copied() else { return };
+        let kit_name = ui.kit.name(hit.note).unwrap_or("").to_string();
+        match &mut ui.overlay {
+            Overlay::Learn { since } if self.shared.recent_seq() != *since => {
+                ui.overlay = Overlay::NameDrum { note: hit.note, edited: !kit_name.is_empty(), text: kit_name, error: None };
+                let _ = self.ctx.focus();
+            }
+            Overlay::NameDrum { note, text, edited, error } if *note != hit.note => {
+                *note = hit.note;
+                *error = None;
+                if !*edited || text.is_empty() {
+                    *edited = !kit_name.is_empty();
+                    *text = kit_name;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -382,6 +489,28 @@ impl Editor {
         }
         self.text(c, r.x + 34.0, r.y + r.h / 2.0, "Stats", 14.0, color, Align::Left);
         ui.regions.push((r, Action::ShowStats));
+
+        // Drums, left of Stats.
+        let r = Rect::new(w - 196.0, 14.0, 92.0, 32.0);
+        let hovered = r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
+        if hovered {
+            Self::rounded(c, r, 4.0, Some(theme::hover_fill()), None);
+        }
+        let color = if hovered { theme::text() } else { theme::dim() };
+        let (ix, iy) = (r.x + 21.0, r.y + r.h / 2.0);
+        let mut p = Path::new();
+        p.ellipse(ix, iy - 3.0, 6.5, 2.5);
+        p.move_to(ix - 6.5, iy - 3.0);
+        p.line_to(ix - 6.5, iy + 4.0);
+        p.move_to(ix + 6.5, iy - 3.0);
+        p.line_to(ix + 6.5, iy + 4.0);
+        c.stroke_path(&p, &Paint::color(color).with_line_width(1.1));
+        let mut p = Path::new();
+        p.move_to(ix - 6.5, iy + 4.0);
+        p.quad_to(ix, iy + 8.0, ix + 6.5, iy + 4.0);
+        c.stroke_path(&p, &Paint::color(color).with_line_width(1.1));
+        self.text(c, r.x + 36.0, r.y + r.h / 2.0, "Drums", 14.0, color, Align::Left);
+        ui.regions.push((r, Action::ShowKit));
 
         // The count.
         let s = commas(ui.snapshot.total);
@@ -556,26 +685,7 @@ impl Editor {
     fn draw_stats(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
         let w = WIDTH as f32;
         // Top bar: back, profile, spans.
-        let back = Rect::new(12.0, 12.0, 100.0, 32.0);
-        let hovered = back.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
-        if hovered {
-            Self::rounded(c, back, 4.0, Some(theme::hover_fill()), None);
-        }
-        let color = if hovered { theme::text() } else { theme::dim() };
-        Self::chevron(c, back.x + 14.0, back.y + 16.0, 5.0, -1, color);
-        self.text(c, back.x + 26.0, back.y + 16.0, "Counter", 14.0, color, Align::Left);
-        ui.regions.push((back, Action::ShowCounter));
-
-        let name = ui.snapshot.profile.clone();
-        let nw = self.measure(c, &name, 14.0, 300.0);
-        let r = Rect::new(back.x + back.w + 4.0, 12.0, nw + 36.0, 32.0);
-        let hovered = r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
-        if hovered {
-            Self::rounded(c, r, 4.0, Some(theme::hover_fill()), None);
-        }
-        self.text(c, r.x + 12.0, r.y + 16.0, &name, 14.0, theme::text(), Align::Left);
-        Self::chevron(c, r.x + 12.0 + nw + 12.0, r.y + 16.0, 3.0, 0, theme::dim());
-        ui.regions.push((r, Action::OpenProfiles));
+        self.top_bar(c, ui);
 
         let mut x = w - 16.0;
         for span in stats::SPANS.iter().rev() {
@@ -679,7 +789,8 @@ impl Editor {
         Self::rounded(c, panel, 6.0, Some(theme::panel_fill()), Some(Paint::color(theme::hairline())));
         self.label(c, panel.x + 14.0, panel.y + 18.0, "Notes", theme::dim(), Align::Left);
         let pc = stats::pitch_classes(&stats.notes);
-        if let Some(scale) = stats::likely_scale(&pc) {
+        let scale = if ui.note_mode == NoteMode::Drums { None } else { stats::likely_scale(&pc) };
+        if let Some(scale) = scale {
             let paint = theme::gradient(panel.x + 70.0, 0.0, panel.x + 300.0, 0.0, 255)
                 .with_font(&[self.font])
                 .with_font_size(13.0)
@@ -687,14 +798,18 @@ impl Editor {
                 .with_text_baseline(Baseline::Middle);
             let _ = c.fill_text(panel.x + 70.0, panel.y + 18.0, format!("mostly {scale}"), &paint);
         }
-        let all = ui.all_notes;
-        let r2 = Rect::new(panel.x + panel.w - 74.0, panel.y + 6.0, 64.0, 24.0);
+        let mode = ui.note_mode;
+        let r3 = Rect::new(panel.x + panel.w - 60.0, panel.y + 6.0, 50.0, 24.0);
+        let r2 = Rect::new(r3.x - 66.0, panel.y + 6.0, 64.0, 24.0);
         let r1 = Rect::new(r2.x - 86.0, panel.y + 6.0, 84.0, 24.0);
-        self.small_toggle(c, ui, r1, "Pitch class", !all, Action::NoteMode(false));
-        self.small_toggle(c, ui, r2, "All notes", all, Action::NoteMode(true));
+        self.small_toggle(c, ui, r1, "Pitch class", mode == NoteMode::PitchClass, Action::NoteMode(NoteMode::PitchClass));
+        self.small_toggle(c, ui, r2, "All notes", mode == NoteMode::All, Action::NoteMode(NoteMode::All));
+        self.small_toggle(c, ui, r3, "Drums", mode == NoteMode::Drums, Action::NoteMode(NoteMode::Drums));
 
         let area = Rect::new(panel.x + 14.0, panel.y + 40.0, panel.w - 28.0, panel.h - 66.0);
-        if all {
+        if mode == NoteMode::Drums {
+            self.draw_drum_bars(c, ui, &stats.notes, area);
+        } else if mode == NoteMode::All {
             let lo = stats.notes.iter().position(|&n| n > 0).unwrap_or(36) as u8;
             let hi = stats.notes.iter().rposition(|&n| n > 0).unwrap_or(72) as u8;
             let (mut lo, mut hi) = (lo, hi.max(lo));
@@ -706,9 +821,10 @@ impl Editor {
                 }
             }
             let values: Vec<u64> = (lo..=hi).map(|n| stats.notes[n as usize]).collect();
+            let kit = ui.kit.clone();
             self.bars(c, ui, area, &values, &|i| {
                 let note = lo + i as u8;
-                match stats::gm_drum_name(note) {
+                match kit.name(note).or_else(|| stats::gm_drum_name(note)) {
                     Some(d) => format!("{} · {} · {}", note, stats::note_name(note), d),
                     None => format!("{} · {}", note, stats::note_name(note)),
                 }
@@ -779,11 +895,13 @@ impl Editor {
             ui.loading = false;
         }
         ui.snapshot = self.shared.snapshot();
+        ui.kit = self.shared.kit();
         ui.regions.clear();
         ui.tips.clear();
         match ui.view {
             View::Counter => self.draw_counter(c, ui),
             View::Stats => self.draw_stats(c, ui),
+            View::Kit => self.draw_kit(c, ui),
         }
         let mut overlay = std::mem::replace(&mut ui.overlay, Overlay::None);
         // Draw overlays with the hover state they'd have (overlay set back first).
@@ -799,6 +917,14 @@ impl Editor {
                 ui.overlay = Overlay::NewProfile { text: String::new(), error: None };
                 self.draw_new_profile(c, ui, text, error.as_deref());
             }
+            Overlay::Learn { .. } => {
+                ui.overlay = Overlay::Learn { since: 0 };
+                self.draw_learn(c, ui);
+            }
+            Overlay::NameDrum { note, text, error, .. } => {
+                ui.overlay = Overlay::Learn { since: 0 };
+                self.draw_name_drum(c, ui, *note, text, error.as_deref());
+            }
         }
         ui.overlay = overlay;
         ui.drawn_hover = Self::hover_state(ui);
@@ -806,7 +932,7 @@ impl Editor {
         drop(canvas);
 
         if let (Some(path), false) = (&self.options.screenshot, ui.screenshot_done) {
-            let ready = ui.view == View::Counter || (ui.stats.is_some() && !ui.loading);
+            let ready = ui.view != View::Stats || (ui.stats.is_some() && !ui.loading);
             if ready {
                 ui.screenshot_done = true;
                 self.save_screenshot(path);
@@ -830,7 +956,7 @@ impl Editor {
 
     fn on_key(&self, ui: &mut Ui, ev: &keyboard_types::KeyboardEvent) -> bool {
         if ev.state != KeyState::Down {
-            return matches!(ui.overlay, Overlay::NewProfile { .. });
+            return matches!(ui.overlay, Overlay::NewProfile { .. } | Overlay::NameDrum { .. });
         }
         match &mut ui.overlay {
             Overlay::NewProfile { text, error } => {
@@ -854,7 +980,30 @@ impl Editor {
                 }
                 true
             }
-            Overlay::Profiles { .. } => {
+            Overlay::NameDrum { text, edited, error, .. } => {
+                match &ev.key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.save_drum(ui);
+                        return true;
+                    }
+                    Key::Named(NamedKey::Escape) => ui.overlay = Overlay::None,
+                    Key::Named(NamedKey::Backspace) => {
+                        text.pop();
+                        *edited = true;
+                        *error = None;
+                    }
+                    Key::Character(s) if !ev.modifiers.ctrl() && !ev.modifiers.meta() => {
+                        if text.chars().count() < crate::kit::MAX_DRUM_NAME {
+                            text.extend(s.chars().filter(|c| !c.is_control()));
+                        }
+                        *edited = true;
+                        *error = None;
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Overlay::Profiles { .. } | Overlay::Learn { .. } => {
                 if ev.key == Key::Named(NamedKey::Escape) {
                     ui.overlay = Overlay::None;
                     return true;
@@ -884,7 +1033,15 @@ impl WindowHandler for Editor {
         let hits = self.shared.hits_seen();
         let generation = self.shared.generation.load(std::sync::atomic::Ordering::Relaxed);
         let stats_ready = ui.incoming.lock().map(|s| s.is_some()).unwrap_or(false);
-        if hits != ui.seen_hits || generation != ui.seen_generation || stats_ready {
+        let recent = self.shared.recent_seq();
+        let recent_changed = recent != ui.seen_recent;
+        if recent_changed {
+            ui.seen_recent = recent;
+            self.on_recent_hit(&mut ui);
+        }
+        // Ignored hits matter only where the monitor or a learn dialog shows them.
+        let recent_shown = recent_changed && (ui.view == View::Kit || !matches!(ui.overlay, Overlay::None));
+        if hits != ui.seen_hits || generation != ui.seen_generation || stats_ready || recent_shown {
             ui.seen_hits = hits;
             ui.seen_generation = generation;
             self.ctx.request_redraw();
@@ -916,6 +1073,18 @@ impl WindowHandler for Editor {
                 EventStatus::Captured
             }
             Event::Mouse(MouseEvent::WheelScrolled { delta, .. }) => {
+                if matches!(ui.overlay, Overlay::None) && ui.view == View::Kit {
+                    let dy = match delta {
+                        ScrollDelta::Lines { y, .. } => y,
+                        ScrollDelta::Pixels { y, .. } => y / 30.0,
+                    };
+                    if dy < 0.0 {
+                        ui.kit_scroll += 1;
+                    } else if dy > 0.0 {
+                        ui.kit_scroll = ui.kit_scroll.saturating_sub(1);
+                    }
+                    self.ctx.request_redraw();
+                }
                 if let Overlay::Profiles { scroll } = &mut ui.overlay {
                     let dy = match delta {
                         ScrollDelta::Lines { y, .. } => y,

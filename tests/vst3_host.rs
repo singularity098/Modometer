@@ -135,13 +135,17 @@ fn host_round_trip() {
         assert_eq!(component.setActive(1), kResultOk);
         assert_eq!(processor.setProcessing(1), kResultOk);
 
-        // Three real hits, one velocity-0 note-on (a note-off) and a note-off.
+        // Three real hits, one velocity-0 note-on (a note-off), a note-off, and a double trigger
+        // of 42 (1 ms later, inside the default 30 ms retrigger guard).
+        let mut retrigger = note_on(42, 0.1);
+        retrigger.sampleOffset = 48;
         let events = ComWrapper::new(Events(vec![
             note_on(36, 1.0),
             note_on(38, 0.5),
             note_on(38, 0.0),
             note_off(36),
             note_on(42, 0.25),
+            retrigger,
         ]));
         let events = events.to_com_ptr::<IEventList>().unwrap();
 

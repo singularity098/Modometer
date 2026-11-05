@@ -6,6 +6,7 @@
 //! ```text
 //! cargo run --example preview                       # counter view, fake playing
 //! cargo run --example preview -- --stats            # stats view
+//! cargo run --example preview -- --kit              # drums view
 //! cargo run --example preview -- --screenshot a.png # save the first frame and exit
 //! ```
 //! Data goes to a temporary folder unless MIDI_COUNTER_DATA_DIR is set.
@@ -56,6 +57,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1)).map(Into::into);
     let start_in_stats = args.iter().any(|a| a == "--stats");
+    let start_in_kit = args.iter().any(|a| a == "--kit");
     let root = std::env::var_os("MIDI_COUNTER_DATA_DIR")
         .map(Into::into)
         .unwrap_or_else(|| std::env::temp_dir().join("midi-counter-preview"));
@@ -67,14 +69,32 @@ fn main() {
     let shared = Shared::new(store);
     shared.start();
 
-    // Pretend someone's playing.
+    if start_in_kit && shared.kit().names.is_empty() {
+        for (note, name) in [(36, "Kick"), (38, "Snare"), (40, "Snare"), (42, "Hi-hat"), (49, "Crash 1"), (57, "Crash 2")] {
+            shared.set_drum_name(note, Some(name)).unwrap();
+        }
+    }
+
+    // Pretend someone's playing: a little groove, with the odd double trigger.
     let player = Arc::clone(&shared);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(180));
-        player.record_hit(store::now_minute() as u32, 52, 96);
+    std::thread::spawn(move || {
+        let mut guard = midi_counter::session::Guard::default();
+        let start = std::time::Instant::now();
+        let pattern = [36u8, 42, 38, 42, 36, 36, 38, 49];
+        for i in 0.. {
+            // A quick burst first, so a screenshot of the drums view has hits in it.
+            std::thread::sleep(std::time::Duration::from_millis(if i < 8 { 5 } else { 180 }));
+            let note = pattern[i % pattern.len()];
+            let at = start.elapsed().as_micros() as u64 * 48 / 1000;
+            let minute = store::now_minute() as u32;
+            player.note_on(&mut guard, at, 48000.0, minute, note, 70 + (i % 5) as u8 * 10);
+            if i % 3 == 0 {
+                player.note_on(&mut guard, at + 48 * 9, 48000.0, minute, note, 20);
+            }
+        }
     });
 
-    let options = Options { screenshot, start_in_stats };
+    let options = Options { screenshot, start_in_stats, start_in_kit };
     let window = ui::window_settings(1.0).into_iter().find_map(|settings| {
         let (s, options) = (Arc::clone(&shared), options.clone());
         baseview::Window::create(settings, move |ctx| Editor::new(ctx, s, options)).ok()

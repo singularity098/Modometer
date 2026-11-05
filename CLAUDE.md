@@ -18,7 +18,7 @@ forever, with stats. Vendor "Kaia". MIT.
 - MIT license, so no GPL dependencies: VST3 goes through the `vst3` crate (MIT/Apache) and our own
   layer in `src/vst3/`, not nih-plug (its VST3 bindings are GPLv3).
 - Count only what's played: in Reaper the plugin goes in Input FX. The plugin itself counts every
-  note-on with velocity > 0.
+  note-on with velocity > 0 that passes the per-profile retrigger guard (default 30 ms per drum).
 - Never modify audio or MIDI: audio is copied through, and there's no MIDI output bus, so the host
   passes MIDI on.
 - Storage: append-only per-month text logs, one line per minute (see Requirements). Velocity is kept.
@@ -31,9 +31,10 @@ forever, with stats. Vendor "Kaia". MIT.
 src/store.rs        Log format, profiles, month files, totals cache
 src/session.rs      Per-instance state: RT ring buffer, pending minutes, autosave thread, profile switching
 src/stats.rs        Ranges and buckets in local time, note/velocity histograms, scale guess, GM drum names
-src/ui/             The editor: baseview + femtovg (mod.rs), colours and helpers (theme.rs)
+src/kit.rs          Per-profile settings.txt: drum map (note -> name) and retrigger guard
+src/ui/             The editor: baseview + femtovg (mod.rs), Drums view (kit.rs), colours and helpers (theme.rs)
 src/vst3/           VST3 factory and component (mod.rs), editor view embedding (view.rs)
-examples/preview.rs     The window on its own with fake data; --stats, --screenshot <png>
+examples/preview.rs     The window on its own with fake data; --stats, --kit, --screenshot <png>
 examples/embed_test.rs  Embeds the editor via IPlugView into a parent window, like a host
 tests/vst3_host.rs      Drives the plugin through its VST3 interfaces
 scripts/bundle.sh       Builds "MIDI Counter.vst3" (--install copies to ~/.vst3)

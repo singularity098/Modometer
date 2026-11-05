@@ -9,7 +9,7 @@
 
 mod view;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{uid, Class, ComRef, ComWrapper};
 
-use crate::session::Shared;
+use crate::session::{Guard, Shared};
 use crate::store::{self, Store};
 
 pub const PLUGIN_NAME: &str = "MIDI Counter";
@@ -52,6 +52,10 @@ pub fn copy_wstring(src: &str, dst: &mut [TChar]) {
 pub struct MidiCounter {
     shared: Arc<Shared>,
     sample64: Cell<bool>,
+    // Audio thread only: the retrigger guard, a sample clock and the sample rate.
+    guard: RefCell<Guard>,
+    clock: Cell<u64>,
+    rate: Cell<f64>,
 }
 
 // The host calls the controller and processor parts from its own threads as the VST3 threading
@@ -67,7 +71,13 @@ impl MidiCounter {
     pub const CID: TUID = uid(0x4D494449, 0x4B616961, 0x436F756E, 0x74657231);
 
     pub fn new() -> MidiCounter {
-        MidiCounter { shared: Shared::new(Store::new(store::default_root())), sample64: Cell::new(false) }
+        MidiCounter {
+            shared: Shared::new(Store::new(store::default_root())),
+            sample64: Cell::new(false),
+            guard: RefCell::new(Guard::default()),
+            clock: Cell::new(0),
+            rate: Cell::new(48000.0),
+        }
     }
 
     pub fn shared(&self) -> &Arc<Shared> {
@@ -228,19 +238,27 @@ impl IAudioProcessorTrait for MidiCounter {
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
         if let Some(setup) = setup.as_ref() {
             self.sample64.set(setup.symbolicSampleSize == SymbolicSampleSizes_::kSample64 as i32);
+            if setup.sampleRate > 0.0 {
+                self.rate.set(setup.sampleRate);
+            }
         }
         kResultOk
     }
 
     unsafe fn setProcessing(&self, _state: TBool) -> tresult {
+        // The clock stops while not processing; forget old hits so a gap can't look short.
+        if let Ok(mut g) = self.guard.try_borrow_mut() {
+            g.reset();
+        }
         kResultOk
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let Some(data) = data.as_ref() else { return kResultOk };
 
-        // Count note-ons. Note-on with velocity 0 is a note-off.
-        if let Some(events) = ComRef::from_raw(data.inputEvents) {
+        // Count note-ons (note-on with velocity 0 is a note-off), through the retrigger guard.
+        let clock = self.clock.get();
+        if let (Some(events), Ok(mut guard)) = (ComRef::from_raw(data.inputEvents), self.guard.try_borrow_mut()) {
             let mut minute = None;
             for i in 0..events.getEventCount() {
                 let mut e: Event = std::mem::zeroed();
@@ -253,9 +271,11 @@ impl IAudioProcessorTrait for MidiCounter {
                     continue;
                 }
                 let m = *minute.get_or_insert_with(|| store::now_minute() as u32);
-                self.shared.record_hit(m, on.pitch as u8, vel);
+                let at = clock + e.sampleOffset.max(0) as u64;
+                self.shared.note_on(&mut guard, at, self.rate.get(), m, on.pitch as u8, vel);
             }
         }
+        self.clock.set(clock + data.numSamples.max(0) as u64);
 
         // Audio through, untouched.
         let n = data.numSamples.max(0) as usize;

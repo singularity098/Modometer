@@ -39,6 +39,18 @@ record new decisions here.
 - **Name**: "MIDI Counter", developer/vendor "Kaia".
 - **Branch**: work on `main` and push there.
 
+## Owner's requests and decisions (2026-11-05, after first use)
+
+- **One hit, one count.** Single e-drum strikes counted as 2 to 12+. A strike on an e-drum pad can
+  send several note-ons (double triggers, head and rim zones). Decision: a per-profile **retrigger
+  guard**: a note-on of a drum less than `retrigger-ms` after that drum's last *counted* hit is not
+  counted. Default 30 ms; choices Off, 10, 20, 30, 40, 50, 75, 100, 150 ms. It applies to new hits
+  only; old logs are not rewritten.
+- **Drum map.** Name notes per profile ("Snare", "Crash 2", custom names) with a **Learn** button.
+  Notes with the same name (compared without case) are one drum, for the guard and in the stats.
+- **Where the data is**: unchanged (`~/.local/share/midi-counter`); the README now says `.local` is
+  hidden and lists the files.
+
 ## Design
 
 ### Plugin
@@ -46,7 +58,13 @@ record new decisions here.
   one MIDI input bus; no MIDI output bus, so the host passes MIDI on unchanged (CCs, pitch bend and
   all, which re-emitting VST3 events couldn't do faithfully).
 - No parameters. The plugin state is just the profile name.
-- A note-on with velocity > 0 counts as one hit. Note-on with velocity 0 is a note-off.
+- A note-on with velocity > 0 counts as one hit, unless the retrigger guard drops it. Note-on with
+  velocity 0 is a note-off.
+- Retrigger guard: on the audio thread, per drum (a note, or all notes sharing a name), compared in
+  samples (a sample clock advanced by each block, plus the event's offset). The note → drum table and
+  the window are atomics the UI thread updates; no locks on the audio thread.
+- Every note-on, counted or not, also goes into a 10-slot lock-free list of recent hits (packed in
+  one `AtomicU64` each) for the Drums view's monitor and for Learn.
 - The audio thread pushes each hit (minute, note, velocity: 8 bytes) into a lock-free ring buffer.
   No allocation, locks or I/O on the audio thread.
 
@@ -74,7 +92,11 @@ Why this over SQLite or JSON:
 - **Readable**: the files can be opened, searched and backed up by hand.
 - **RAM**: only unsaved minutes and the running totals are kept. Month files are read when the stats
   view needs them, only the months in the selected range.
-- `totals.cache` keeps each month's total and the byte length it covers, written when an instance
+- `settings.txt` holds the profile's settings: `retrigger-ms <ms>` and `note <n> <name>` lines. It's
+written atomically (temp file + rename) when changed in the UI; each instance re-reads it when its
+modification time changes (checked at autosave), so instances on one profile agree.
+
+`totals.cache` keeps each month's total and the byte length it covers, written when an instance
   closes. On load, a month whose log hasn't grown is taken from the cache; one that grew is read from
   where the cache stopped. The last two months are always read, to count today's notes.
 
@@ -89,15 +111,21 @@ Times are stored in UTC and shown in local time, so DST changes and travel stay 
   the thing under the mouse changes. Measured idle cost with the window open: about 0.35% of a core.
 - Font: Jost (variable; 200 for the counter, 300 elsewhere), from Xythos, SIL OFL.
 - Gradient: Xythos's Iris preset, #c688d6 → #a85eea → #7278fe.
-- Counter view: profile picker (top left; switch or create profiles), Stats (top right), the count,
-  and today's count.
+- Counter view: profile picker (top left; switch or create profiles), Drums and Stats (top right),
+  the count, and today's count.
+- Drums view: the drum map (Learn, rename, remove; click a recent hit to name its note), the recent
+  hits monitor (note, name, velocity, gap since the drum's last note, ignored or not), and the
+  retrigger guard setting. Naming dialog: text field, preset names, Save/Remove/Cancel; hitting
+  another pad while it's open switches the note.
 - Stats view: span (hour, day, week, month, year, all) with previous/next, bucket size, a bar chart
-  with hover values, notes by pitch class or by note (with GM drum names and a likely-scale guess),
-  and a velocity histogram.
+  with hover values, notes by pitch class, by note (with your drum names, else GM drum names, and a
+  likely-scale guess) or by named drum, and a velocity histogram.
 
 ## Open items
 
 - Test in Reaper on the owner's machine: loading, Input FX, MIDI pass-through to an instrument after
   it, typing a profile name (keyboard focus in the embedded window), HiDPI.
 - Renaming and deleting profiles from the UI (for now: rename or delete the folder).
+- Check the retrigger guard with the owner's kit: what one strike sends (Drums view, Recent hits),
+  and whether 30 ms suits.
 - LV2, other hosts and platforms, if wanted later.
