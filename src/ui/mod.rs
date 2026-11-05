@@ -1146,17 +1146,6 @@ fn fit(w: f32, h: f32) -> (f32, f32, f32) {
     (scale, ox, oy)
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn fit_keeps_the_shape() {
-        assert_eq!(super::fit(800.0, 450.0), (1.0, 0.0, 0.0));
-        assert_eq!(super::fit(1600.0, 900.0), (2.0, 0.0, 0.0));
-        assert_eq!(super::fit(1000.0, 450.0), (1.0, 100.0, 0.0));
-        assert_eq!(super::fit(800.0, 650.0), (1.0, 0.0, 100.0));
-    }
-}
-
 fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) {
     // Minimal PNG writer (stored zlib blocks), so the plugin needs no image crate.
     fn crc32(data: &[u8]) -> u32 {
@@ -1204,4 +1193,15 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) {
     chunk(&mut out, b"IDAT", &z);
     chunk(&mut out, b"IEND", &[]);
     let _ = std::fs::write(path, out);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fit_keeps_the_shape() {
+        assert_eq!(super::fit(800.0, 450.0), (1.0, 0.0, 0.0));
+        assert_eq!(super::fit(1600.0, 900.0), (2.0, 0.0, 0.0));
+        assert_eq!(super::fit(1000.0, 450.0), (1.0, 100.0, 0.0));
+        assert_eq!(super::fit(800.0, 650.0), (1.0, 0.0, 100.0));
+    }
 }
