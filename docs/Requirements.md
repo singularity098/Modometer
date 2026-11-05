@@ -51,6 +51,14 @@ record new decisions here.
   only; old logs are not rewritten.
 - **Drum map.** Name notes per profile ("Snare", "Crash 2", custom names) with a **Learn** button.
   Notes with the same name (compared without case) are one drum, for the guard and in the stats.
+- **Time played** (owner, 2026-11-05): for the range shown, minutes logged and an estimate of time
+  actually played, notes per minute of playing (average) and the busiest minute, and the average
+  per bucket (hour, day, ...). The estimate counts each logged minute as min(1, hits / pace). The
+  pace is learned from the profile's last 90 days: half the median of mid-session minutes (minutes
+  whose neighbours both have hits), so normal variation in steady playing counts as full minutes and
+  a session's ragged first and last minutes count in part. Fewer than 10 mid-session minutes: no
+  estimate, every logged minute counts in full. The pace is cached for an hour per profile. The
+  timeline toggles between notes and time.
 - **Where the data is**: unchanged (`~/.local/share/modometer`); the README now says `.local` is
   hidden and lists the files.
 
@@ -130,7 +138,10 @@ Times are stored in UTC and shown in local time, so DST changes and travel stay 
   another pad while it's open switches the note.
 - Stats view: span (hour, day, week, month, year, all) with previous/next, bucket size, a bar chart
   with hover values, notes by pitch class, by note (with your drum names, else GM drum names, and a
-  likely-scale guess) or by named drum, and a velocity histogram.
+  likely-scale guess) or by named drum, and a velocity histogram. Under the range: time played
+  (hover: minutes logged and the pace), notes a minute and the busiest minute (hover: when), and the
+  average per bucket over the buckets started so far (dropped if the line doesn't fit). The
+  timeline shows notes or time (Notes / Time); its tooltips give notes, time and the busiest minute.
 
 ## Open items
 

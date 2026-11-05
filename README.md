@@ -13,6 +13,10 @@ A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
 - **Stats**: notes per minute, hour, day, week, month or year over any hour, day, week, month or year
   (or all time); which notes you play most (by pitch class or by note, with General MIDI drum names),
   your likely scale, and how hard you play (velocity).
+- **Time played**: how long you played in any range, notes a minute (average and busiest minute),
+  and the average per hour, day, week, month or year. The timeline can show time instead of notes.
+  A minute with only a few notes (the start or end of a session) counts as part of a minute,
+  measured against your usual pace (see "How time played is worked out" below).
 - The window can be resized: drag the edge of the plugin window and everything scales, keeping its
   shape. Each instance remembers its size.
 - Very light: the audio thread only pushes a few bytes per note into a lock-free queue. The window
@@ -51,6 +55,17 @@ Click **Drums** on the counter screen.
   usually come within 5–20 ms.
 
 The stats view's notes panel has a **Drums** tab with hits per named drum (unnamed notes as Other).
+
+### How time played is worked out
+
+The logs keep one line per minute you played in, so the minutes logged are an upper bound: a
+minute where you hit two notes and stopped counts as a whole one. So Modometer also estimates. It
+learns your pace from the last 90 days: the minutes in the middle of a session (with played minutes
+on both sides) show what steady playing looks like, and half their median is a "full minute". A
+minute with that many notes or more counts as a whole minute; one with fewer counts in proportion
+(a quarter of the notes, a quarter of a minute). With less than ten mid-session minutes to go on,
+every logged minute counts in full. Hover over "About … played" to see the logged time and the
+pace. Very slow, sparse playing will read a little low.
 
 ## Building and installing
 
