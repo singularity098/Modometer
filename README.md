@@ -56,8 +56,8 @@ The stats view's notes panel has a **Drums** tab with hits per named drum (unnam
 
 Every push is built and tested by GitHub Actions. To get a build without compiling: open the
 repository's **Actions** tab, pick the latest **Build** run, and download the
-`MIDI-Counter-vst3-linux-…` artifact at the bottom. Unzip it and copy `MIDI Counter.vst3` into
-`~/.vst3`. It needs glibc 2.35 or newer (Ubuntu 22.04 and later, and most current distros).
+`MIDI-Counter-vst3-linux-…` artifact at the bottom. Unzip it and copy `MIDI-Counter.vst3` into
+`~/.vst3` (delete an older `MIDI Counter.vst3` there, if any). It needs glibc 2.35 or newer (Ubuntu 22.04 and later, and most current distros).
 
 To build it yourself you need Rust (stable); X11 and OpenGL are loaded at run time.
 
@@ -65,7 +65,8 @@ To build it yourself you need Rust (stable); X11 and OpenGL are loaded at run ti
 ./scripts/bundle.sh --install
 ```
 
-This builds `target/bundle/MIDI Counter.vst3` and copies it to `~/.vst3`. Rescan plugins in Reaper.
+This builds `target/bundle/MIDI-Counter.vst3` and copies it to `~/.vst3`, removing an older
+`MIDI Counter.vst3`. Rescan plugins in Reaper. The plugin is still called "MIDI Counter" there.
 
 ## Your data
 

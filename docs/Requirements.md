@@ -36,7 +36,8 @@ record new decisions here.
 - **Background**: plain near-black, no image.
 - **Data location**: the normal app-data folder (`~/.local/share/midi-counter`); the owner will
   symlink it into a synced folder.
-- **Name**: "MIDI Counter", developer/vendor "Kaia".
+- **Name**: "MIDI Counter", developer/vendor "Kaia". On disk the bundle is `MIDI-Counter.vst3`
+  (with `MIDI-Counter.so` inside), no space (owner, 2026-11-05).
 - **Branch**: work on `main` and push there.
 
 ## Owner's requests and decisions (2026-11-05, after first use)
