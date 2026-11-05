@@ -88,6 +88,7 @@ enum Action {
     Prev,
     Next,
     NoteMode(NoteMode),
+    ChartMode(ChartMode),
     ShowKit,
     Learn,
     /// Open the naming dialog for a note.
@@ -113,6 +114,19 @@ enum NoteMode {
     All,
     Drums,
 }
+
+/// What the timeline shows per bucket.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ChartMode {
+    Notes,
+    Time,
+}
+
+/// A profile's pace (see `stats::pace`), and the minute it was worked out.
+type PaceCache = Option<(String, i64, Option<f64>)>;
+
+/// How long a cached pace is used before it's worked out again, in minutes.
+const PACE_MAX_AGE: i64 = 60;
 
 enum Overlay {
     None,
@@ -142,7 +156,9 @@ struct Ui {
     stats: Option<Stats>,
     incoming: Arc<Mutex<Option<Stats>>>,
     loading: bool,
+    pace: Arc<Mutex<PaceCache>>,
     note_mode: NoteMode,
+    chart_mode: ChartMode,
     /// The mouse cursor last set on the window.
     cursor: MouseCursor,
     kit: Kit,
@@ -205,7 +221,9 @@ impl Editor {
             stats: None,
             incoming: Arc::new(Mutex::new(None)),
             loading: false,
+            pace: Arc::new(Mutex::new(None)),
             note_mode: NoteMode::PitchClass,
+            chart_mode: ChartMode::Notes,
             kit: shared.kit(),
             cursor: MouseCursor::Default,
             kit_scroll: 0,
@@ -254,9 +272,21 @@ impl Editor {
         let incoming = Arc::clone(&ui.incoming);
         let waker = self.ctx.waker();
         let query = ui.query;
+        let pace_cache = Arc::clone(&ui.pace);
         std::thread::spawn(move || {
             let pending = shared.pending();
-            let s = stats::compute(shared.store(), &shared.profile_name(), query, &pending);
+            let profile = shared.profile_name();
+            let now = crate::store::now_minute();
+            let cached = pace_cache.lock().unwrap().clone();
+            let pace = match cached {
+                Some((p, at, pace)) if p == profile && now - at < PACE_MAX_AGE => pace,
+                _ => {
+                    let pace = stats::pace(shared.store(), &profile, &pending);
+                    *pace_cache.lock().unwrap() = Some((profile.clone(), now, pace));
+                    pace
+                }
+            };
+            let s = stats::compute(shared.store(), &profile, query, &pending, pace);
             *incoming.lock().unwrap() = Some(s);
             waker.request_redraw();
         });
@@ -312,6 +342,7 @@ impl Editor {
                 self.load_stats(ui);
             }
             Action::NoteMode(mode) => ui.note_mode = mode,
+            Action::ChartMode(mode) => ui.chart_mode = mode,
             Action::ShowKit => ui.view = View::Kit,
             Action::Learn => {
                 ui.overlay = Overlay::Learn { since: self.shared.recent_seq() };
@@ -641,6 +672,11 @@ impl Editor {
 
     /// Bars in `area`, with hover tips. `labels` gives each bar's tooltip title.
     fn bars(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, area: Rect, values: &[u64], tip: &dyn Fn(usize) -> String) {
+        self.bars_with(c, ui, area, values, &|i| (tip(i), commas(values[i])));
+    }
+
+    /// Bars in `area`; `tip` gives each bar's tooltip title and value.
+    fn bars_with(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, area: Rect, values: &[u64], tip: &dyn Fn(usize) -> (String, String)) {
         let n = values.len().max(1);
         let max = values.iter().copied().max().unwrap_or(0).max(1) as f32;
         let slot = area.w / n as f32;
@@ -676,7 +712,8 @@ impl Editor {
             }
         }
         for i in 0..n.min(values.len()) {
-            ui.tips.push((Rect::new(area.x + i as f32 * slot, area.y, slot, area.h), format!("{}\n{}", tip(i), commas(values[i]))));
+            let (title, value) = tip(i);
+            ui.tips.push((Rect::new(area.x + i as f32 * slot, area.y, slot, area.h), format!("{title}\n{value}")));
         }
     }
 
@@ -772,25 +809,71 @@ impl Editor {
             self.label(c, bx - 8.0, 77.0, "by", theme::faint(), Align::Right);
         }
 
+        // Time played, pace and averages; what the timeline shows.
+        if let Some(s) = &ui.stats {
+            if s.total > 0 {
+                let mut x = 16.0;
+                let limit = w - 16.0 - 110.0;
+                for (i, (text, tip)) in summary(s).into_iter().enumerate() {
+                    let sep = if i > 0 { "  ·  " } else { "" };
+                    let sep_w = self.measure(c, sep, 12.5, 300.0);
+                    let tw = self.measure(c, &text, 12.5, 300.0);
+                    if x + sep_w + tw > limit {
+                        break;
+                    }
+                    self.text(c, x, 108.0, sep, 12.5, theme::faint(), Align::Left);
+                    x += sep_w;
+                    self.text(c, x, 108.0, &text, 12.5, theme::dim(), Align::Left);
+                    if let Some((title, value)) = tip {
+                        ui.tips.push((Rect::new(x, 98.0, tw, 20.0), format!("{title}\n{value}")));
+                    }
+                    x += tw;
+                }
+            }
+        }
+        let rt = Rect::new(w - 16.0 - 46.0, 96.0, 46.0, 24.0);
+        let rn = Rect::new(rt.x - 52.0, 96.0, 50.0, 24.0);
+        let mode = ui.chart_mode;
+        self.small_toggle(c, ui, rn, "Notes", mode == ChartMode::Notes, Action::ChartMode(ChartMode::Notes));
+        self.small_toggle(c, ui, rt, "Time", mode == ChartMode::Time, Action::ChartMode(ChartMode::Time));
+
         // Timeline.
-        let chart = Rect::new(60.0, 116.0, w - 76.0, 140.0);
+        let chart = Rect::new(60.0, 130.0, w - 76.0, 126.0);
         let loading_alpha = if ui.loading { 0.5 } else { 1.0 };
         c.save();
         c.set_global_alpha(loading_alpha);
 
         if let Some(stats) = ui.stats.take() {
-            let max = stats.counts.iter().copied().max().unwrap_or(0);
+            let time = ui.chart_mode == ChartMode::Time;
+            // In time mode the bars are seconds of (estimated) playing.
+            let values: Vec<u64> = if time {
+                stats.played.iter().map(|&m| (m * 60.0).round() as u64).collect()
+            } else {
+                stats.counts.clone()
+            };
+            let max = values.iter().copied().max().unwrap_or(0);
+            let axis = |v: u64| if time { theme::short_duration(v as f64 / 60.0) } else { theme::short(v) };
             Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h, theme::hairline());
             Self::hline(c, chart.x, chart.x + chart.w, chart.y, theme::hairline().with_alpha(10));
             Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h / 2.0, theme::hairline().with_alpha(10));
             if max > 0 {
-                self.text(c, chart.x - 8.0, chart.y, &theme::short(max), 11.0, theme::faint(), Align::Right);
-                self.text(c, chart.x - 8.0, chart.y + chart.h / 2.0, &theme::short(max / 2), 11.0, theme::faint(), Align::Right);
+                self.text(c, chart.x - 8.0, chart.y, &axis(max), 11.0, theme::faint(), Align::Right);
+                self.text(c, chart.x - 8.0, chart.y + chart.h / 2.0, &axis(max / 2), 11.0, theme::faint(), Align::Right);
             }
             self.text(c, chart.x - 8.0, chart.y + chart.h, "0", 11.0, theme::faint(), Align::Right);
             let n = stats.counts.len();
             let stats_ref = &stats;
-            self.bars(c, ui, chart, &stats.counts, &|i| stats_ref.bucket_label(i));
+            self.bars_with(c, ui, chart, &values, &|i| {
+                let s = stats_ref;
+                let played = played_text(s.played[i], s.logged[i], s.pace.is_some(), s.query.bucket == Bucket::Minute);
+                let value = match (time, s.counts[i]) {
+                    (_, 0) => "Not played".to_string(),
+                    (true, _) => played,
+                    (false, n) if s.query.bucket == Bucket::Minute => format!("{} notes", commas(n)),
+                    (false, n) => format!("{} notes · {} · up to {} a minute", commas(n), played, commas(s.peak[i])),
+                };
+                (s.bucket_label(i), value)
+            });
             // Axis labels: about six, evenly spread.
             let step = (n as f32 / 6.0).ceil().max(1.0) as usize;
             let slot = chart.w / n.max(1) as f32;
@@ -1139,6 +1222,62 @@ impl WindowHandler for Editor {
 }
 
 /// Fits the 800 × 450 layout into a `w` × `h` window: (scale, x offset, y offset).
+/// The time played in a bucket, for its tooltip: "about 35 min · 41 logged", or in seconds for a
+/// minute. Without a pace the logged minutes are all there is.
+fn played_text(played: f64, logged: u32, estimated: bool, minute: bool) -> String {
+    if minute {
+        return if estimated { format!("about {:.0} s", played * 60.0) } else { "played".to_string() };
+    }
+    if !estimated {
+        return format!("{} played", theme::duration(logged as f64));
+    }
+    format!("about {} · {} logged", theme::duration(played), theme::duration(logged as f64))
+}
+
+/// The line under the range, in parts: time played, notes a minute (average and most), and averages
+/// per bucket. Each part has an optional tooltip (title, value).
+fn summary(s: &Stats) -> Vec<(String, Option<(String, String)>)> {
+    let mut parts = Vec::new();
+    if s.pace.is_some() {
+        parts.push((
+            format!("About {} played", theme::duration(s.played_total)),
+            Some((
+                format!("{} logged; part-played minutes count in part", theme::duration(s.logged_total as f64)),
+                format!("a full minute is {}+ notes", commas(s.pace.unwrap_or(0.0).round() as u64)),
+            )),
+        ));
+    } else {
+        parts.push((format!("{} played", theme::duration(s.played_total)), None));
+    }
+    if let Some(rate) = s.per_minute() {
+        let most = s.busiest.map(|(_, n)| n).unwrap_or(0);
+        let tip = s.busiest_label().map(|when| (format!("Busiest minute: {when}"), format!("{} notes", commas(most))));
+        parts.push((format!("{} notes a minute, {} at most", commas(rate.round() as u64), commas(most)), tip));
+    }
+    let per = match s.query.bucket {
+        Bucket::Minute => None,
+        Bucket::Hour => Some("an hour"),
+        Bucket::Day => Some("a day"),
+        Bucket::Week => Some("a week"),
+        Bucket::Month => Some("a month"),
+        Bucket::Year => Some("a year"),
+    };
+    if let Some(per) = per.filter(|_| s.elapsed > 1) {
+        let n = s.elapsed as f64;
+        parts.push((
+            format!("{} notes and {} {per}", commas((s.total as f64 / n).round() as u64), theme::duration(s.played_total / n)),
+            Some((format!("On average, over the {} so far", plural(s)), "including the ones you didn't play".to_string())),
+        ));
+    }
+    parts
+}
+
+/// "5 days", "1 week": how many buckets have started.
+fn plural(s: &Stats) -> String {
+    let unit = s.query.bucket.label().to_lowercase();
+    if s.elapsed == 1 { format!("1 {unit}") } else { format!("{} {unit}s", s.elapsed) }
+}
+
 fn fit(w: f32, h: f32) -> (f32, f32, f32) {
     let scale = (w / WIDTH as f32).min(h / HEIGHT as f32).max(0.01);
     let ox = ((w - WIDTH as f32 * scale) / 2.0).max(0.0).floor();

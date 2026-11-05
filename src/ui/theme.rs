@@ -73,6 +73,27 @@ pub fn commas(n: u64) -> String {
     out
 }
 
+/// Minutes as "45 min", "3 h 05 min", or "1,234 h" from 100 hours.
+pub fn duration(minutes: f64) -> String {
+    let m = minutes.round() as u64;
+    match m {
+        0 if minutes > 0.0 => "< 1 min".to_string(),
+        0..=59 => format!("{m} min"),
+        60..=5_999 => format!("{} h {:02} min", m / 60, m % 60),
+        _ => format!("{} h", commas((minutes / 60.0).round() as u64)),
+    }
+}
+
+/// Minutes as "45m", "3h 05", "120h" for axis labels.
+pub fn short_duration(minutes: f64) -> String {
+    let m = minutes.round() as u64;
+    match m {
+        0..=59 => format!("{m}m"),
+        60..=599 => format!("{}h {:02}", m / 60, m % 60),
+        _ => format!("{}h", short((minutes / 60.0).round() as u64)),
+    }
+}
+
 /// 1234 -> "1.2k" for axis labels.
 pub fn short(n: u64) -> String {
     match n {
@@ -101,5 +122,16 @@ mod tests {
         assert_eq!(super::commas(999), "999");
         assert_eq!(super::commas(1000), "1,000");
         assert_eq!(super::commas(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(super::duration(0.0), "0 min");
+        assert_eq!(super::duration(0.2), "< 1 min");
+        assert_eq!(super::duration(45.4), "45 min");
+        assert_eq!(super::duration(185.0), "3 h 05 min");
+        assert_eq!(super::duration(123_456.0), "2,058 h");
+        assert_eq!(super::short_duration(185.0), "3h 05");
+        assert_eq!(super::short_duration(1200.0), "20h");
     }
 }

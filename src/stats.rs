@@ -3,6 +3,11 @@
 
 //! Stats over a date range: hits per time bucket, per note and per velocity.
 //! Ranges and buckets follow local time (days start at local midnight, weeks on Monday).
+//!
+//! Time played: the logs have one line per minute with hits, so the minutes logged are an upper
+//! bound on the time played. A minute at the start or end of a session, or with a pause in it, has
+//! fewer hits than a minute of steady playing, so each minute also gets an estimate: its hits over
+//! the profile's *pace* (hits in a full minute), at most one minute. See [`pace`].
 
 use std::collections::BTreeMap;
 
@@ -94,9 +99,24 @@ pub struct Stats {
     /// Bucket start times (local), and one past the last bucket's end.
     pub edges: Vec<NaiveDateTime>,
     pub counts: Vec<u64>,
+    /// Minutes with hits, per bucket.
+    pub logged: Vec<u32>,
+    /// Estimated minutes of playing, per bucket (see [`pace`]).
+    pub played: Vec<f64>,
+    /// The most hits in one minute, per bucket.
+    pub peak: Vec<u64>,
+    /// The busiest minute in the range: (unix minute, hits).
+    pub busiest: Option<(i64, u64)>,
     pub notes: [u64; 128],
     pub vels: [u64; 128],
     pub total: u64,
+    pub logged_total: u64,
+    pub played_total: f64,
+    /// The pace the estimate used: hits that make a full minute. None: too little history, and
+    /// every logged minute counts as a full one.
+    pub pace: Option<f64>,
+    /// Buckets that have started by now, for averages per bucket.
+    pub elapsed: usize,
 }
 
 impl Stats {
@@ -110,6 +130,18 @@ impl Stats {
             Bucket::Month => t.format("%B %Y").to_string(),
             Bucket::Year => t.format("%Y").to_string(),
         }
+    }
+
+    /// The busiest minute's local time, e.g. "Tue 3 Nov, 20:14".
+    pub fn busiest_label(&self) -> Option<String> {
+        let (m, _) = self.busiest?;
+        let t = Local.timestamp_opt(m * 60, 0).single()?;
+        Some(t.format("%a %-d %b, %H:%M").to_string())
+    }
+
+    /// Hits per minute of playing over the range, if anything was played.
+    pub fn per_minute(&self) -> Option<f64> {
+        (self.played_total > 0.0).then(|| self.total as f64 / self.played_total)
     }
 
     /// A short axis label for bucket `i`.
@@ -219,8 +251,90 @@ pub fn range(q: Query, store: &Store, profile: &str, now: NaiveDateTime) -> (Nai
     }
 }
 
-/// Computes stats from the profile's logs plus its unsaved minutes.
-pub fn compute(store: &Store, profile: &str, q: Query, pending: &BTreeMap<i64, MinuteCounts>) -> Stats {
+/// Calls `f(minute, total, line)` for every log line in [start_m, end_m), then for every unsaved
+/// minute in it (with `None`). A minute can come more than once (two instances, or saved and
+/// unsaved parts of it); callers add them up.
+fn scan(
+    store: &Store,
+    profile: &str,
+    (start_m, end_m): (i64, i64),
+    pending: &BTreeMap<i64, MinuteCounts>,
+    detail: bool,
+    mut f: impl FnMut(i64, u64, Option<&store::Line>, Option<&MinuteCounts>),
+) {
+    let mut month = Month::of_minute(start_m);
+    let last = Month::of_minute(end_m - 1);
+    let available = store.months(profile);
+    while month <= last {
+        if available.binary_search(&month).is_ok() {
+            let _ = store::scan_file(&store.month_path(profile, month), 0, detail, |l| {
+                if l.minute >= start_m && l.minute < end_m {
+                    f(l.minute, l.total, Some(l), None);
+                }
+            });
+        }
+        month = month.next();
+    }
+    for (&minute, c) in pending.range(start_m..end_m) {
+        f(minute, c.total as u64, None, Some(c));
+    }
+}
+
+/// Sorts (minute, hits) pairs and adds up repeated minutes.
+fn merge_minutes(mut minutes: Vec<(i64, u64)>) -> Vec<(i64, u64)> {
+    minutes.sort_unstable_by_key(|&(m, _)| m);
+    let mut out: Vec<(i64, u64)> = Vec::with_capacity(minutes.len());
+    for (m, t) in minutes {
+        match out.last_mut() {
+            Some(last) if last.0 == m => last.1 += t,
+            _ => out.push((m, t)),
+        }
+    }
+    out
+}
+
+/// Days of history the pace is learned from.
+pub const PACE_DAYS: i64 = 90;
+/// Mid-session minutes needed before the pace is trusted.
+const PACE_MIN_SAMPLES: usize = 10;
+
+/// The pace from sorted, merged (minute, hits) pairs: hits in a minute that counts as a full minute
+/// of playing. Learned from minutes in the middle of a session (the minutes before and after it
+/// have hits too), whose hits are typical of steady playing, unlike a session's first and last
+/// minutes. It's half their median, so the usual ups and downs of steady playing (a slower song,
+/// a fill) still count as full minutes, while a minute with a handful of hits counts as seconds.
+pub fn pace_of(minutes: &[(i64, u64)]) -> Option<f64> {
+    let mut mid: Vec<u64> = minutes
+        .windows(3)
+        .filter(|w| w[0].0 + 1 == w[1].0 && w[1].0 + 1 == w[2].0)
+        .map(|w| w[1].1)
+        .collect();
+    if mid.len() < PACE_MIN_SAMPLES {
+        return None;
+    }
+    let half = mid.len() / 2;
+    let (_, &mut median, _) = mid.select_nth_unstable(half);
+    Some((median as f64 / 2.0).max(1.0))
+}
+
+/// The profile's pace over the last [`PACE_DAYS`] days (see [`pace_of`]).
+pub fn pace(store: &Store, profile: &str, pending: &BTreeMap<i64, MinuteCounts>) -> Option<f64> {
+    let now = store::now_minute();
+    let mut minutes = Vec::new();
+    scan(store, profile, (now - PACE_DAYS * 1440, now + 1), pending, false, |m, t, _, _| minutes.push((m, t)));
+    pace_of(&merge_minutes(minutes))
+}
+
+/// The estimated minutes of playing in a minute with `hits` hits.
+pub fn minute_played(hits: u64, pace: Option<f64>) -> f64 {
+    match pace {
+        Some(p) => (hits as f64 / p).min(1.0),
+        None => 1.0,
+    }
+}
+
+/// Computes stats from the profile's logs plus its unsaved minutes. `pace` is from [`pace`].
+pub fn compute(store: &Store, profile: &str, q: Query, pending: &BTreeMap<i64, MinuteCounts>, pace: Option<f64>) -> Stats {
     let now = Local::now().naive_local();
     let (start, end, title) = range(q, store, profile, now);
 
@@ -232,57 +346,65 @@ pub fn compute(store: &Store, profile: &str, q: Query, pending: &BTreeMap<i64, M
     }
     let edge_minutes: Vec<i64> = edges.iter().map(|&t| local_to_minute(t)).collect();
     let (start_m, end_m) = (edge_minutes[0], *edge_minutes.last().unwrap());
+    let n = edges.len() - 1;
+    let elapsed = edges[..n].partition_point(|&e| e <= now).max(1);
 
     let mut stats = Stats {
         query: q,
         title,
-        counts: vec![0; edges.len() - 1],
+        counts: vec![0; n],
+        logged: vec![0; n],
+        played: vec![0.0; n],
+        peak: vec![0; n],
+        busiest: None,
         edges,
         notes: [0; 128],
         vels: [0; 128],
         total: 0,
+        logged_total: 0,
+        played_total: 0.0,
+        pace,
+        elapsed,
     };
+    let bucket_of = |minute: i64| edge_minutes.partition_point(|&e| e <= minute).saturating_sub(1);
 
-    let mut add = |minute: i64, total: u64, notes: &mut dyn Iterator<Item = (u8, u64)>, vels: &mut dyn Iterator<Item = (u8, u64)>| {
-        if minute < start_m || minute >= end_m {
-            return;
-        }
-        let i = edge_minutes.partition_point(|&e| e <= minute).saturating_sub(1);
-        if let Some(c) = stats.counts.get_mut(i) {
+    let mut minutes = Vec::new();
+    scan(store, profile, (start_m, end_m), pending, true, |minute, total, line, unsaved| {
+        minutes.push((minute, total));
+        if let Some(c) = stats.counts.get_mut(bucket_of(minute)) {
             *c += total;
         }
         stats.total += total;
-        for (n, c) in notes {
-            stats.notes[n as usize] += c;
+        if let Some(l) = line {
+            for &(n, c) in &l.notes {
+                stats.notes[n as usize] += c as u64;
+            }
+            for &(v, c) in &l.vels {
+                stats.vels[v as usize] += c as u64;
+            }
         }
-        for (v, c) in vels {
-            stats.vels[v as usize] += c;
+        if let Some(c) = unsaved {
+            for (i, &n) in c.notes.iter().enumerate() {
+                stats.notes[i] += n as u64;
+            }
+            for (i, &n) in c.vels.iter().enumerate() {
+                stats.vels[i] += n as u64;
+            }
         }
-    };
-
-    let mut month = Month::of_minute(start_m);
-    let last = Month::of_minute(end_m - 1);
-    let available = store.months(profile);
-    while month <= last {
-        if available.binary_search(&month).is_ok() {
-            let _ = store::scan_file(&store.month_path(profile, month), 0, true, |l| {
-                add(
-                    l.minute,
-                    l.total,
-                    &mut l.notes.iter().map(|&(n, c)| (n, c as u64)),
-                    &mut l.vels.iter().map(|&(v, c)| (v, c as u64)),
-                );
-            });
+    });
+    for (minute, hits) in merge_minutes(minutes) {
+        let i = bucket_of(minute);
+        let played = minute_played(hits, pace);
+        if let (Some(l), Some(p), Some(k)) = (stats.logged.get_mut(i), stats.played.get_mut(i), stats.peak.get_mut(i)) {
+            *l += 1;
+            *p += played;
+            *k = (*k).max(hits);
         }
-        month = month.next();
-    }
-    for (&minute, c) in pending.range(start_m..end_m) {
-        add(
-            minute,
-            c.total as u64,
-            &mut c.notes.iter().enumerate().filter(|(_, &n)| n > 0).map(|(i, &n)| (i as u8, n as u64)),
-            &mut c.vels.iter().enumerate().filter(|(_, &n)| n > 0).map(|(i, &n)| (i as u8, n as u64)),
-        );
+        if stats.busiest.is_none_or(|(_, b)| hits > b) {
+            stats.busiest = Some((minute, hits));
+        }
+        stats.logged_total += 1;
+        stats.played_total += played;
     }
     stats
 }
@@ -357,7 +479,7 @@ mod tests {
         let store = Store::new(std::env::temp_dir().join("modometer-stats-none"));
         for span in SPANS {
             for &bucket in span.buckets() {
-                let s = compute(&store, "nobody", Query { span, offset: -1, bucket }, &BTreeMap::new());
+                let s = compute(&store, "nobody", Query { span, offset: -1, bucket }, &BTreeMap::new(), None);
                 assert!(!s.counts.is_empty(), "{span:?} {bucket:?}");
                 assert!(s.counts.len() <= 1500, "{span:?} {bucket:?} {}", s.counts.len());
                 assert!(s.edges.windows(2).all(|w| w[0] < w[1]));
@@ -384,13 +506,50 @@ mod tests {
         let mut pending = BTreeMap::new();
         pending.insert(m + 60, c);
 
-        let s = compute(&store, "P", Query { span: Span::Day, offset: 0, bucket: Bucket::Hour }, &pending);
+        let s = compute(&store, "P", Query { span: Span::Day, offset: 0, bucket: Bucket::Hour }, &pending, None);
         assert_eq!(s.total, 6);
+        assert_eq!(s.logged[9], 1);
+        assert_eq!(s.peak[10], 3);
+        assert_eq!(s.busiest, Some((m, 3)));
+        assert_eq!(s.logged_total, 2);
+        assert_eq!(s.played_total, 2.0);
+        // A pace of 6 hits a minute: each 3-hit minute is half a minute of playing.
+        let s = compute(&store, "P", Query { span: Span::Day, offset: 0, bucket: Bucket::Hour }, &pending, Some(6.0));
+        assert_eq!(s.played[9], 0.5);
+        assert_eq!(s.played_total, 1.0);
+        assert_eq!(s.per_minute(), Some(6.0));
         assert_eq!(s.counts[9], 3);
         assert_eq!(s.counts[10], 3);
         assert_eq!(s.notes[64], 4);
         assert_eq!(s.vels[80], 2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_minute_saved_twice_is_one_minute() {
+        assert_eq!(merge_minutes(vec![(5, 2), (3, 1), (5, 4)]), vec![(3, 1), (5, 6)]);
+    }
+
+    #[test]
+    fn pace_comes_from_mid_session_minutes() {
+        // Sessions of 12 minutes: 2 hits in the first and last, 110 to 200 in between.
+        let mut minutes = Vec::new();
+        for session in 0..3 {
+            let start = session * 1000;
+            minutes.push((start, 2));
+            for m in 1..11 {
+                minutes.push((start + m, 100 + m as u64 * 10));
+            }
+            minutes.push((start + 11, 2));
+        }
+        // Mid-session minutes are 1..=10 of each session (the 2-hit edges have a gap on one side);
+        // their median is 160, and the pace half that.
+        let pace = pace_of(&minutes).unwrap();
+        assert_eq!(pace, 80.0);
+        assert_eq!(minute_played(2, Some(pace)), 2.0 / 80.0);
+        assert_eq!(minute_played(120, Some(pace)), 1.0);
+        // Too little to learn from.
+        assert_eq!(pace_of(&minutes[..8]), None);
     }
 
     #[test]
