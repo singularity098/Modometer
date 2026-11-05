@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use baseview::gl::{GlConfig, GlContext};
 use baseview::{
-    Event, EventStatus, HandlerError, MouseButton, MouseEvent, ScrollDelta, TimerHandle, WindowContext,
-    WindowHandler, WindowSettings, WindowSize,
+    Event, EventStatus, HandlerError, MouseButton, MouseCursor, MouseEvent, ScrollDelta, TimerHandle,
+    WindowContext, WindowHandler, WindowSettings, WindowSize,
 };
 use femtovg::renderer::OpenGl;
 use femtovg::{Align, Baseline, Canvas, Color, FontId, Paint, Path};
@@ -46,7 +46,7 @@ pub fn window_settings(scale: f64) -> Vec<WindowSettings> {
     let base = WindowSettings::new()
         .with_title("MIDI Counter")
         .with_size(baseview::dpi::PhysicalSize::new(w, h))
-        .with_resizable(false);
+        .with_resizable(true);
     [Some(4), None]
         .into_iter()
         .flat_map(|samples| {
@@ -143,6 +143,8 @@ struct Ui {
     incoming: Arc<Mutex<Option<Stats>>>,
     loading: bool,
     note_mode: NoteMode,
+    /// The mouse cursor last set on the window.
+    cursor: MouseCursor,
     kit: Kit,
     kit_scroll: usize,
     seen_recent: u32,
@@ -174,6 +176,11 @@ impl Editor {
         let mut canvas = Canvas::new(renderer).map_err(|e| handler_error(format!("{e:?}")))?;
         let font = canvas.add_font_mem(theme::FONT).map_err(|e| handler_error(format!("{e:?}")))?;
         let timer = ctx.create_timer(Duration::from_millis(33)).ok();
+        // Give the window its own cursor. Without one, X11 shows the parent's, so the pointer keeps
+        // whatever shape it had outside (a resize arrow, say). baseview assumes the arrow is already
+        // set and skips setting it again, hence the detour.
+        let _ = ctx.set_mouse_cursor(MouseCursor::Text);
+        let _ = ctx.set_mouse_cursor(MouseCursor::Default);
 
         let snapshot = shared.snapshot();
         let span = Span::Week;
@@ -200,6 +207,7 @@ impl Editor {
             loading: false,
             note_mode: NoteMode::PitchClass,
             kit: shared.kit(),
+            cursor: MouseCursor::Default,
             kit_scroll: 0,
             seen_recent: shared.recent_seq(),
             screenshot_done: false,
@@ -220,9 +228,24 @@ impl Editor {
         Ok(editor)
     }
 
-    fn scale(&self) -> f32 {
+    /// How the 800 × 450 layout maps onto the window: (scale, x offset, y offset). The layout keeps
+    /// its shape at any window size; a window of another shape gets even margins.
+    fn layout(&self) -> (f32, f32, f32) {
         let size = self.ctx.size();
-        size.physical.width as f32 / WIDTH as f32
+        fit(size.physical.width as f32, size.physical.height as f32)
+    }
+
+    /// Hand over things you can click, an I-beam over text fields, the arrow elsewhere.
+    fn update_cursor(&self, ui: &mut Ui) {
+        let cursor = match ui.regions.iter().rev().find(|(r, _)| r.contains(ui.mouse)).map(|(_, a)| a) {
+            Some(Action::Field) => MouseCursor::Text,
+            Some(Action::None | Action::CloseOverlay) | None => MouseCursor::Default,
+            Some(_) => MouseCursor::Hand,
+        };
+        if ui.cursor != cursor {
+            ui.cursor = cursor;
+            let _ = self.ctx.set_mouse_cursor(cursor);
+        }
     }
 
     fn load_stats(&self, ui: &mut Ui) {
@@ -880,12 +903,13 @@ impl Editor {
         unsafe { self.gl.make_current() }.map_err(|e| handler_error(e.to_string()))?;
         let size = self.ctx.size();
         let (pw, ph) = (size.physical.width, size.physical.height);
-        let scale = self.scale();
+        let (scale, ox, oy) = self.layout();
         let mut canvas = self.canvas.borrow_mut();
         let c = &mut *canvas;
         c.set_size(pw, ph, 1.0);
         c.clear_rect(0, 0, pw, ph, theme::background());
         c.reset_transform();
+        c.translate(ox, oy);
         c.scale(scale, scale);
 
         let mut ui = self.ui.borrow_mut();
@@ -928,6 +952,7 @@ impl Editor {
         }
         ui.overlay = overlay;
         ui.drawn_hover = Self::hover_state(ui);
+        self.update_cursor(ui);
         c.flush();
         drop(canvas);
 
@@ -1049,12 +1074,13 @@ impl WindowHandler for Editor {
     }
 
     fn on_event(&self, event: Event) -> EventStatus {
-        let scale = self.scale();
+        let (scale, ox, oy) = self.layout();
         let mut ui = self.ui.borrow_mut();
         let ui = &mut *ui;
         match event {
             Event::Mouse(MouseEvent::CursorMoved { position, .. }) => {
-                ui.mouse = (position.x as f32 / scale, position.y as f32 / scale);
+                ui.mouse = ((position.x as f32 - ox) / scale, (position.y as f32 - oy) / scale);
+                self.update_cursor(ui);
                 if Self::hover_state(ui) != ui.drawn_hover {
                     self.ctx.request_redraw();
                 }
@@ -1109,6 +1135,25 @@ impl WindowHandler for Editor {
             }
             _ => EventStatus::Ignored,
         }
+    }
+}
+
+/// Fits the 800 × 450 layout into a `w` × `h` window: (scale, x offset, y offset).
+fn fit(w: f32, h: f32) -> (f32, f32, f32) {
+    let scale = (w / WIDTH as f32).min(h / HEIGHT as f32).max(0.01);
+    let ox = ((w - WIDTH as f32 * scale) / 2.0).max(0.0).floor();
+    let oy = ((h - HEIGHT as f32 * scale) / 2.0).max(0.0).floor();
+    (scale, ox, oy)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fit_keeps_the_shape() {
+        assert_eq!(super::fit(800.0, 450.0), (1.0, 0.0, 0.0));
+        assert_eq!(super::fit(1600.0, 900.0), (2.0, 0.0, 0.0));
+        assert_eq!(super::fit(1000.0, 450.0), (1.0, 100.0, 0.0));
+        assert_eq!(super::fit(800.0, 650.0), (1.0, 0.0, 100.0));
     }
 }
 

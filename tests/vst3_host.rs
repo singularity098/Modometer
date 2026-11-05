@@ -211,6 +211,30 @@ fn host_round_trip() {
         let out_ptr = out.to_com_ptr::<IBStream>().unwrap();
         component.getState(out_ptr.as_ptr());
         assert_eq!(out.data.borrow().as_slice(), b"MIDICOUNTER1\nDrums\n");
+
+        // The editor's size is kept with the state too.
+        let s3 = ComWrapper::new(Stream::default());
+        *s3.data.borrow_mut() = b"MIDICOUNTER1\nDrums\nzoom 1.500\n".to_vec();
+        let s3 = s3.to_com_ptr::<IBStream>().unwrap();
+        assert_eq!(component.setState(s3.as_ptr()), kResultOk);
+        let out = ComWrapper::new(Stream::default());
+        let out_ptr = out.to_com_ptr::<IBStream>().unwrap();
+        component.getState(out_ptr.as_ptr());
+        assert_eq!(out.data.borrow().as_slice(), b"MIDICOUNTER1\nDrums\nzoom 1.500\n");
+        let controller = component.cast::<IEditController>().unwrap();
+        let view = ComPtr::from_raw(controller.createView(c"editor".as_ptr())).unwrap();
+        assert_eq!(view.canResize(), kResultTrue);
+        let mut rect: ViewRect = std::mem::zeroed();
+        assert_eq!(view.getSize(&mut rect), kResultOk);
+        assert_eq!((rect.right, rect.bottom), (1200, 675));
+        // Dragging the width keeps the shape; sizes stay within limits.
+        let mut r = ViewRect { left: 0, top: 0, right: 1600, bottom: 675 };
+        assert_eq!(view.checkSizeConstraint(&mut r), kResultTrue);
+        assert_eq!((r.right, r.bottom), (1600, 900));
+        let mut r = ViewRect { left: 0, top: 0, right: 100, bottom: 100 };
+        view.checkSizeConstraint(&mut r);
+        assert_eq!((r.right, r.bottom), (600, 338));
+        drop((view, controller));
         component.terminate();
     }
     let _ = std::fs::remove_dir_all(&dir);

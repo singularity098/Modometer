@@ -35,7 +35,7 @@ src/kit.rs          Per-profile settings.txt: drum map (note -> name) and retrig
 src/ui/             The editor: baseview + femtovg (mod.rs), Drums view (kit.rs), colours and helpers (theme.rs)
 src/vst3/           VST3 factory and component (mod.rs), editor view embedding (view.rs)
 examples/preview.rs     The window on its own with fake data; --stats, --kit, --screenshot <png>
-examples/embed_test.rs  Embeds the editor via IPlugView into a parent window, like a host
+examples/embed_test.rs  Embeds the editor via IPlugView into a parent window, like a host; --resize
 tests/vst3_host.rs      Drives the plugin through its VST3 interfaces
 scripts/bundle.sh       Builds "MIDI Counter.vst3" (--install copies to ~/.vst3)
 resources/fonts/        Jost (OFL)

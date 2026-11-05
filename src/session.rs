@@ -25,6 +25,9 @@ use crate::store::{self, MinuteCounts, Month, Store};
 pub const AUTOSAVE: Duration = Duration::from_secs(30);
 const DRAIN_EVERY: Duration = Duration::from_secs(2);
 const RING_CAPACITY: usize = 4096;
+/// The editor's size limits, relative to 800 × 450 (times the host's content scale).
+pub const MIN_ZOOM: f32 = 0.75;
+pub const MAX_ZOOM: f32 = 3.0;
 /// How many recent hits the monitor keeps.
 pub const RECENT: usize = 10;
 
@@ -126,6 +129,8 @@ pub struct Shared {
     /// how many were ever written.
     recent: [AtomicU64; RECENT],
     recent_seq: AtomicU32,
+    /// The editor's size relative to its default (f32 bits), kept with the instance's state.
+    zoom: AtomicU32,
     profile: Mutex<Profile>,
     /// Bumped whenever what the UI shows changes for a reason other than a hit.
     pub generation: AtomicU64,
@@ -161,6 +166,7 @@ impl Shared {
             retrigger_ms: AtomicU32::new(kit::DEFAULT_RETRIGGER_MS),
             recent: std::array::from_fn(|_| AtomicU64::new(0)),
             recent_seq: AtomicU32::new(0),
+            zoom: AtomicU32::new(1.0f32.to_bits()),
             profile: Mutex::new(Profile::empty(String::new())),
             generation: AtomicU64::new(0),
             stop: Mutex::new(false),
@@ -252,6 +258,16 @@ impl Shared {
             out.push(hit);
         }
         out
+    }
+
+    pub fn zoom(&self) -> f32 {
+        f32::from_bits(self.zoom.load(Ordering::Relaxed))
+    }
+
+    pub fn set_zoom(&self, zoom: f32) {
+        if zoom.is_finite() {
+            self.zoom.store(zoom.clamp(MIN_ZOOM, MAX_ZOOM).to_bits(), Ordering::Relaxed);
+        }
     }
 
     fn apply_kit(&self, kit: &Kit) {

@@ -106,7 +106,15 @@ when the plugin is unloaded. Worst case on a crash: 30 s of notes.
 Times are stored in UTC and shown in local time, so DST changes and travel stay correct.
 
 ### UI
-- baseview + femtovg (OpenGL), 800 × 450, scaled by the host's content scale factor.
+- baseview + femtovg (OpenGL). Laid out at 800 × 450 and scaled to the window: the view is
+  resizable (owner, 2026-11-05). `checkSizeConstraint` keeps the 16:9 shape between 0.75× and 3×
+  (times the host's content scale), following whichever side the user dragged; `onSize` resizes the
+  window to whatever the host gives, and the layout is centred with even margins if the shape
+  differs. The zoom is saved in the instance's state (`zoom 1.500` after the profile name; older
+  versions ignore it).
+- Mouse cursor: set explicitly when the window opens (on X11 a window without its own cursor shows
+  its parent's, so it kept e.g. the host's resize arrow when entered from the side). A hand over
+  anything clickable, an I-beam over text fields, the arrow elsewhere.
 - Draws only on change: a 30 Hz timer compares one atomic hit counter; mouse moves redraw only when
   the thing under the mouse changes. Measured idle cost with the window open: about 0.35% of a core.
 - Font: Jost (variable; 200 for the counter, 300 elsewhere), from Xythos, SIL OFL.

@@ -13,6 +13,8 @@ A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
 - **Stats**: notes per minute, hour, day, week, month or year over any hour, day, week, month or year
   (or all time); which notes you play most (by pitch class or by note, with General MIDI drum names),
   your likely scale, and how hard you play (velocity).
+- The window can be resized: drag the edge of the plugin window and everything scales, keeping its
+  shape. Each instance remembers its size.
 - Very light: the audio thread only pushes a few bytes per note into a lock-free queue. The window
   draws only when something changes. Saves happen every 30 seconds, and only if you played.
 
@@ -103,7 +105,7 @@ cargo run --example preview
 ```
 
 `preview` opens the window on its own with made-up data (`--stats` or `--kit` to start on the stats
-or drums view, `--screenshot file.png` to save a frame and exit). `embed_test` embeds the editor into a parent
+or drums view, `--screenshot file.png` to save a frame and exit). `embed_test` (`-- 6 --resize` to test resizing) embeds the editor into a parent
 window through the VST3 view interface, as a host does.
 
 ## License

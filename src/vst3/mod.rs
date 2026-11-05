@@ -178,10 +178,17 @@ impl IComponentTrait for MidiCounter {
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
         let Some(bytes) = read_stream(state, 4096) else { return kInvalidArgument };
         if let Some(name) = bytes.strip_prefix(STATE_MAGIC) {
-            let name = String::from_utf8_lossy(name);
-            let name = name.lines().next().unwrap_or("").trim();
+            // The profile name, then optional "key value" lines (older versions wrote only the name).
+            let text = String::from_utf8_lossy(name);
+            let mut lines = text.lines();
+            let name = lines.next().unwrap_or("").trim();
             if !name.is_empty() {
                 self.shared.select_profile(name);
+            }
+            for line in lines {
+                if let Some(z) = line.strip_prefix("zoom ").and_then(|z| z.trim().parse::<f32>().ok()) {
+                    self.shared.set_zoom(z);
+                }
             }
         }
         kResultOk
@@ -192,6 +199,10 @@ impl IComponentTrait for MidiCounter {
         let mut bytes = STATE_MAGIC.to_vec();
         bytes.extend_from_slice(self.shared.profile_name().as_bytes());
         bytes.push(b'\n');
+        let zoom = self.shared.zoom();
+        if (zoom - 1.0).abs() > 0.001 {
+            bytes.extend_from_slice(format!("zoom {zoom:.3}\n").as_bytes());
+        }
         let mut written = 0;
         if stream.write(bytes.as_ptr() as *mut c_void, bytes.len() as i32, &mut written) == kResultOk {
             kResultOk

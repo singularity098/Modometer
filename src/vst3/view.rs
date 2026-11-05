@@ -2,6 +2,10 @@
 // Copyright (c) 2026 singularity098
 
 //! The VST3 editor view: embeds the baseview window into the host's X11 window.
+//!
+//! The view is resizable: the host asks [`checkSizeConstraint`](IPlugViewTrait::checkSizeConstraint)
+//! while the user drags its window's edge (we keep the 16:9 shape, 0.75× to 3×), then calls
+//! `onSize`, and the editor scales its drawing to fit. The size is kept in the instance's state.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CStr};
@@ -12,7 +16,7 @@ use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHan
 use vst3::Class;
 use vst3::Steinberg::*;
 
-use crate::session::Shared;
+use crate::session::{Shared, MAX_ZOOM, MIN_ZOOM};
 use crate::ui::{self, theme, Editor, Options};
 
 pub struct View {
@@ -34,9 +38,25 @@ impl View {
         View { shared, window: RefCell::new(None), scale: Cell::new(1.0) }
     }
 
-    fn size(&self) -> (i32, i32) {
-        let s = self.scale.get();
+    /// The size for a zoom, in physical pixels.
+    fn size_at(&self, zoom: f32) -> (i32, i32) {
+        let s = self.scale.get() * zoom;
         ((theme::WIDTH as f32 * s).round() as i32, (theme::HEIGHT as f32 * s).round() as i32)
+    }
+
+    fn size(&self) -> (i32, i32) {
+        self.size_at(self.shared.zoom())
+    }
+
+    /// The zoom a host-proposed size asks for: whichever side changed more (so dragging one edge
+    /// works), within limits.
+    fn zoom_for(&self, w: i32, h: i32) -> f32 {
+        let s = self.scale.get();
+        let current = self.shared.zoom();
+        let zw = w as f32 / (theme::WIDTH as f32 * s);
+        let zh = h as f32 / (theme::HEIGHT as f32 * s);
+        let z = if (zw - current).abs() >= (zh - current).abs() { zw } else { zh };
+        z.clamp(MIN_ZOOM, MAX_ZOOM)
     }
 }
 
@@ -67,7 +87,7 @@ impl IPlugViewTrait for View {
             return kResultFalse;
         }
         let parent = Parent(parent as usize as u64);
-        for settings in ui::window_settings(self.scale.get() as f64) {
+        for settings in ui::window_settings((self.scale.get() * self.shared.zoom()) as f64) {
             let settings = settings.with_parent(&parent);
             let shared = Arc::clone(&self.shared);
             if let Ok(window) = baseview::Window::create(settings, move |ctx| Editor::new(ctx, shared, Options::default())) {
@@ -103,7 +123,17 @@ impl IPlugViewTrait for View {
         kResultOk
     }
 
-    unsafe fn onSize(&self, _new_size: *mut ViewRect) -> tresult {
+    unsafe fn onSize(&self, new_size: *mut ViewRect) -> tresult {
+        let Some(r) = new_size.as_ref() else { return kInvalidArgument };
+        let (w, h) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
+        // Take whatever the host gives (the editor centres itself in a size of another shape), and
+        // remember the zoom that fits it.
+        let s = self.scale.get();
+        let fits = (w as f32 / (theme::WIDTH as f32 * s)).min(h as f32 / (theme::HEIGHT as f32 * s));
+        self.shared.set_zoom(fits);
+        if let Some(window) = self.window.borrow().as_ref() {
+            let _ = window.resize(baseview::dpi::PhysicalSize::new(w as u32, h as u32));
+        }
         kResultOk
     }
 
@@ -116,12 +146,12 @@ impl IPlugViewTrait for View {
     }
 
     unsafe fn canResize(&self) -> tresult {
-        kResultFalse
+        kResultTrue
     }
 
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
         let Some(rect) = rect.as_mut() else { return kInvalidArgument };
-        let (w, h) = self.size();
+        let (w, h) = self.size_at(self.zoom_for(rect.right - rect.left, rect.bottom - rect.top));
         rect.right = rect.left + w;
         rect.bottom = rect.top + h;
         kResultOk
@@ -130,7 +160,7 @@ impl IPlugViewTrait for View {
 
 impl IPlugViewContentScaleSupportTrait for View {
     unsafe fn setContentScaleFactor(&self, factor: IPlugViewContentScaleSupport_::ScaleFactor) -> tresult {
-        // Applies from the next time the window opens; the window has a fixed size while open.
+        // Applies from the next time the window opens.
         if self.window.borrow().is_some() {
             return kResultFalse;
         }
