@@ -42,7 +42,7 @@ impl Editor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gradient_text(&self, c: &mut Canvas<OpenGl>, x: f32, y: f32, s: &str, size: f32, w: f32, align: Align) {
+    pub(super) fn gradient_text(&self, c: &mut Canvas<OpenGl>, x: f32, y: f32, s: &str, size: f32, w: f32, align: Align) {
         let x0 = match align {
             Align::Right => x - w,
             Align::Center => x - w / 2.0,
@@ -111,8 +111,32 @@ impl Editor {
             self.text(c, panel.x + panel.w - 14.0, panel.y + panel.h - 13.0, &shown, 11.0, theme::faint(), Align::Right);
         }
 
-        self.draw_recent(c, ui, Rect::new(500.0, 64.0, w - 516.0, 284.0));
-        self.draw_guard(c, ui, Rect::new(500.0, 358.0, w - 516.0, 76.0));
+        self.draw_recent(c, ui, Rect::new(500.0, 64.0, w - 516.0, 232.0));
+        self.draw_guard(c, ui, Rect::new(500.0, 304.0, w - 516.0, 68.0));
+        self.draw_pedal_setting(c, ui, Rect::new(500.0, 380.0, w - 516.0, 54.0));
+    }
+
+    /// Whether to read the hi-hat pedal (CC 4), for how open the hats are played.
+    fn draw_pedal_setting(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, panel: Rect) {
+        Self::rounded(c, panel, 6.0, Some(theme::panel_fill()), Some(Paint::color(theme::hairline())));
+        self.label(c, panel.x + 14.0, panel.y + 18.0, "Hi-hat pedal", theme::dim(), Align::Left);
+        self.text(c, panel.x + 14.0, panel.y + 38.0, "Read CC 4 to see how open you play", 12.0, theme::faint().with_alpha(120), Align::Left);
+        let on = ui.kit.pedal_cc != 0;
+        let r = Rect::new(panel.x + panel.w - 62.0, panel.y + 13.0, 50.0, 28.0);
+        let hovered = r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
+        let stroke = if on { theme::window_gradient(220) } else { Paint::color(theme::hairline()) };
+        Self::rounded(c, r, 14.0, hovered.then(theme::hover_fill), Some(stroke));
+        let label = if on { "On" } else { "Off" };
+        if on {
+            self.gradient_text(c, r.x + r.w / 2.0, r.y + r.h / 2.0, label, 13.5, 30.0, Align::Center);
+        } else {
+            self.text(c, r.x + r.w / 2.0, r.y + r.h / 2.0, label, 13.5, if hovered { theme::text() } else { theme::dim() }, Align::Center);
+        }
+        ui.regions.push((r, Action::TogglePedal));
+        ui.tips.push((
+            Rect::new(panel.x, panel.y, panel.w - 70.0, panel.h),
+            "Maps MIDI CC 4 to the plugin's Hi-hat pedal parameter\nTry it in Reaper: check your hi-hat still works".into(),
+        ));
     }
 
     /// Back, profile picker: the same top bar as the stats view.
@@ -144,13 +168,14 @@ impl Editor {
         self.label(c, panel.x + 14.0, panel.y + 20.0, "Recent hits", theme::dim(), Align::Left);
         let hits = self.shared.recent_hits();
         if hits.is_empty() {
-            self.text(c, panel.x + panel.w / 2.0, panel.y + 140.0, "Hit something", 14.0, theme::dim(), Align::Center);
-            self.text(c, panel.x + panel.w / 2.0, panel.y + 164.0, "Every note-on that arrives shows here.", 12.0, theme::faint().with_alpha(110), Align::Center);
+            self.text(c, panel.x + panel.w / 2.0, panel.y + 104.0, "Hit something", 14.0, theme::dim(), Align::Center);
+            self.text(c, panel.x + panel.w / 2.0, panel.y + 128.0, "Every note-on that arrives shows here.", 12.0, theme::faint().with_alpha(110), Align::Center);
             return;
         }
         let row_h = 24.0;
         let mut y = panel.y + 38.0;
-        for (i, hit) in hits.iter().enumerate() {
+        let fit = ((panel.h - 42.0) / row_h) as usize;
+        for (i, hit) in hits.iter().take(fit).enumerate() {
             let r = Rect::new(panel.x + 6.0, y, panel.w - 12.0, row_h);
             let hovered = r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
             if hovered {
@@ -184,13 +209,13 @@ impl Editor {
 
     fn draw_guard(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, panel: Rect) {
         Self::rounded(c, panel, 6.0, Some(theme::panel_fill()), Some(Paint::color(theme::hairline())));
-        self.label(c, panel.x + 14.0, panel.y + 20.0, "Retrigger guard", theme::dim(), Align::Left);
-        self.text(c, panel.x + 14.0, panel.y + 44.0, "Repeats of a drum within", 12.0, theme::faint().with_alpha(120), Align::Left);
-        self.text(c, panel.x + 14.0, panel.y + 60.0, "this time count once", 12.0, theme::faint().with_alpha(120), Align::Left);
+        self.label(c, panel.x + 14.0, panel.y + 18.0, "Retrigger guard", theme::dim(), Align::Left);
+        self.text(c, panel.x + 14.0, panel.y + 38.0, "Repeats of a drum within", 12.0, theme::faint().with_alpha(120), Align::Left);
+        self.text(c, panel.x + 14.0, panel.y + 53.0, "this time count once", 12.0, theme::faint().with_alpha(120), Align::Left);
         let ms = ui.kit.retrigger_ms;
         let value = if ms == 0 { "Off".to_string() } else { format!("{ms} ms") };
         let cx = panel.x + panel.w - 62.0;
-        let cy = panel.y + 44.0;
+        let cy = panel.y + 38.0;
         self.gradient_text(c, cx, cy, &value, 16.0, 60.0, Align::Center);
         for (dir, x) in [(-1, cx - 48.0), (1, cx + 48.0)] {
             let r = Rect::new(x - 13.0, cy - 14.0, 26.0, 28.0);

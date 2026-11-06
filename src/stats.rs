@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 
-use crate::store::{self, MinuteCounts, Month, Store};
+use crate::store::{self, Detail, MinuteCounts, Month, Store};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Span {
@@ -117,7 +117,35 @@ pub struct Stats {
     pub pace: Option<f64>,
     /// Buckets that have started by now, for averages per bucket.
     pub elapsed: usize,
+    /// The analysis over the range, added up.
+    pub detail: Detail,
+    /// Per bucket: velocities, the tempo you played at, and timing (hits measured, sum of their
+    /// distances from the grid in 0.1 ms).
+    pub bucket_vels: Vec<[u32; 128]>,
+    pub bucket_tempo: Vec<BTreeMap<u16, u32>>,
+    pub bucket_timing: Vec<(u32, u64)>,
+    /// Hits per weekday (Monday first) and hour, local time.
+    pub week_hours: [[u64; 24]; 7],
+    /// Hits per local day.
+    pub days: BTreeMap<NaiveDate, u64>,
+    /// Stretches of playing, oldest first.
+    pub sessions: Vec<Session>,
 }
+
+/// A stretch of playing: minutes with hits, no more than [`SESSION_GAP`] minutes apart.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Session {
+    /// First minute, and one past the last (unix minutes).
+    pub start: i64,
+    pub end: i64,
+    pub hits: u64,
+    /// Estimated minutes of playing.
+    pub played: f64,
+    pub pitch_classes: [u64; 12],
+}
+
+/// Minutes without a hit that end a session.
+pub const SESSION_GAP: i64 = 10;
 
 impl Stats {
     pub fn bucket_label(&self, i: usize) -> String {
@@ -365,26 +393,67 @@ pub fn compute(store: &Store, profile: &str, q: Query, pending: &BTreeMap<i64, M
         played_total: 0.0,
         pace,
         elapsed,
+        detail: Detail::default(),
+        bucket_vels: vec![[0; 128]; n],
+        bucket_tempo: vec![BTreeMap::new(); n],
+        bucket_timing: vec![(0, 0); n],
+        week_hours: [[0; 24]; 7],
+        days: BTreeMap::new(),
+        sessions: Vec::new(),
     };
     let bucket_of = |minute: i64| edge_minutes.partition_point(|&e| e <= minute).saturating_sub(1);
 
-    let mut minutes = Vec::new();
+    // (minute, hits, pitch classes)
+    let mut minutes: Vec<(i64, u64, [u32; 12])> = Vec::new();
     scan(store, profile, (start_m, end_m), pending, true, |minute, total, line, unsaved| {
-        minutes.push((minute, total));
-        if let Some(c) = stats.counts.get_mut(bucket_of(minute)) {
+        let i = bucket_of(minute);
+        if let Some(c) = stats.counts.get_mut(i) {
             *c += total;
         }
         stats.total += total;
+        let mut pc = [0u32; 12];
         if let Some(c) = line.map(|l| &l.counts).or(unsaved) {
-            for (i, &n) in c.notes.iter().enumerate() {
-                stats.notes[i] += n as u64;
+            for (k, &n) in c.notes.iter().enumerate() {
+                stats.notes[k] += n as u64;
+                pc[k % 12] += n;
             }
-            for (i, &n) in c.vels.iter().enumerate() {
-                stats.vels[i] += n as u64;
+            for (k, &n) in c.vels.iter().enumerate() {
+                stats.vels[k] += n as u64;
+            }
+            stats.detail.merge(&c.detail);
+            if i < n {
+                for (a, b) in stats.bucket_vels[i].iter_mut().zip(&c.vels) {
+                    *a += b;
+                }
+                for (&bpm, &hits) in &c.detail.tempo {
+                    *stats.bucket_tempo[i].entry(bpm).or_default() += hits;
+                }
+                let t = &mut stats.bucket_timing[i];
+                *t = (t.0 + c.detail.timing.0, t.1 + c.detail.timing.1);
             }
         }
+        minutes.push((minute, total, pc));
     });
-    for (minute, hits) in merge_minutes(minutes) {
+
+    // Merge repeated minutes.
+    minutes.sort_unstable_by_key(|m| m.0);
+    let mut merged: Vec<(i64, u64, [u32; 12])> = Vec::with_capacity(minutes.len());
+    for (m, t, pc) in minutes {
+        match merged.last_mut() {
+            Some(last) if last.0 == m => {
+                last.1 += t;
+                for (a, b) in last.2.iter_mut().zip(pc) {
+                    *a += b;
+                }
+            }
+            _ => merged.push((m, t, pc)),
+        }
+    }
+
+    for &(minute, hits, pc) in &merged {
+        if hits == 0 {
+            continue; // analysis that finished after the minute's hits were saved
+        }
         let i = bucket_of(minute);
         let played = minute_played(hits, pace);
         if let (Some(l), Some(p), Some(k)) = (stats.logged.get_mut(i), stats.played.get_mut(i), stats.peak.get_mut(i)) {
@@ -397,8 +466,224 @@ pub fn compute(store: &Store, profile: &str, q: Query, pending: &BTreeMap<i64, M
         }
         stats.logged_total += 1;
         stats.played_total += played;
+        if let Some(t) = Local.timestamp_opt(minute * 60, 0).single() {
+            let t = t.naive_local();
+            stats.week_hours[t.weekday().num_days_from_monday() as usize][t.hour() as usize] += hits;
+            *stats.days.entry(t.date()).or_default() += hits;
+        }
+        match stats.sessions.last_mut() {
+            Some(s) if minute - s.end < SESSION_GAP => {
+                s.end = minute + 1;
+                s.hits += hits;
+                s.played += played;
+                for (a, b) in s.pitch_classes.iter_mut().zip(pc) {
+                    *a += b as u64;
+                }
+            }
+            _ => stats.sessions.push(Session {
+                start: minute,
+                end: minute + 1,
+                hits,
+                played,
+                pitch_classes: pc.map(|n| n as u64),
+            }),
+        }
     }
     stats
+}
+
+/// Mean, median and most common of a weighted histogram (value -> weight).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Summary {
+    pub mean: f64,
+    pub median: f64,
+    pub mode: f64,
+    pub count: u64,
+}
+
+pub fn summarize<K: Copy + Into<f64>>(hist: &BTreeMap<K, u32>) -> Option<Summary> {
+    let count: u64 = hist.values().map(|&n| n as u64).sum();
+    if count == 0 {
+        return None;
+    }
+    let mean = hist.iter().map(|(&k, &n)| k.into() * n as f64).sum::<f64>() / count as f64;
+    let mut acc = 0;
+    let mut median = 0.0;
+    for (&k, &n) in hist {
+        acc += n as u64;
+        if acc * 2 >= count {
+            median = k.into();
+            break;
+        }
+    }
+    // The mode, smoothed over neighbours (1 BPM apart is the same tempo, give or take).
+    let smoothed = |k: f64| hist.iter().filter(|(&j, _)| (j.into() - k).abs() <= 1.0).map(|(_, &n)| n as u64).sum::<u64>();
+    let mode = hist.keys().map(|&k| k.into()).max_by_key(|&k| (smoothed(k), hist.iter().find(|(&j, _)| j.into() == k).map(|(_, &n)| n).unwrap_or(0))).unwrap_or(0.0);
+    Some(Summary { mean, median, mode, count })
+}
+
+/// The value at `q` (0..1) of a velocity histogram.
+pub fn quantile(vels: &[u32; 128], q: f64) -> Option<u8> {
+    let count: u64 = vels.iter().map(|&n| n as u64).sum();
+    if count == 0 {
+        return None;
+    }
+    let target = (q * count as f64).ceil().max(1.0) as u64;
+    let mut acc = 0;
+    for (v, &n) in vels.iter().enumerate() {
+        acc += n as u64;
+        if acc >= target {
+            return Some(v as u8);
+        }
+    }
+    Some(127)
+}
+
+/// Average of a velocity histogram.
+pub fn average_velocity(vels: &[u32; 128]) -> Option<f64> {
+    let count: u64 = vels.iter().map(|&n| n as u64).sum();
+    (count > 0).then(|| vels.iter().enumerate().map(|(v, &n)| v as f64 * n as f64).sum::<f64>() / count as f64)
+}
+
+// ---- Everything played: calendar, streaks, personal bests ----
+
+/// A profile's whole history, by local day.
+#[derive(Clone, Debug, Default)]
+pub struct History {
+    pub days: BTreeMap<NaiveDate, u64>,
+    /// The busiest minute ever: (unix minute, hits).
+    pub best_minute: Option<(i64, u64)>,
+}
+
+/// A run of days in a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Streak {
+    pub first: NaiveDate,
+    pub last: NaiveDate,
+}
+
+impl Streak {
+    pub fn days(&self) -> i64 {
+        (self.last - self.first).num_days() + 1
+    }
+}
+
+impl History {
+    pub fn compute(store: &Store, profile: &str, pending: &BTreeMap<i64, MinuteCounts>) -> History {
+        let mut minutes: BTreeMap<i64, u64> = BTreeMap::new();
+        for month in store.months(profile) {
+            store.scan_month(profile, month, false, |l| *minutes.entry(l.minute).or_default() += l.total);
+        }
+        for (&m, c) in pending {
+            *minutes.entry(m).or_default() += c.total as u64;
+        }
+        let mut h = History::default();
+        for (&m, &n) in &minutes {
+            if n == 0 {
+                continue;
+            }
+            *h.days.entry(local_date(m)).or_default() += n;
+            if h.best_minute.is_none_or(|(_, b)| n > b) {
+                h.best_minute = Some((m, n));
+            }
+        }
+        h
+    }
+
+    /// Runs of days played, oldest first.
+    pub fn streaks(&self) -> Vec<Streak> {
+        let mut out: Vec<Streak> = Vec::new();
+        for &d in self.days.keys() {
+            match out.last_mut() {
+                Some(s) if s.last.succ_opt() == Some(d) => s.last = d,
+                _ => out.push(Streak { first: d, last: d }),
+            }
+        }
+        out
+    }
+
+    /// The streak still going on `today` (played today or yesterday), if any.
+    pub fn current_streak(&self, today: NaiveDate) -> Option<Streak> {
+        self.streaks().into_iter().last().filter(|s| s.last >= today.pred_opt().unwrap_or(today))
+    }
+
+    pub fn longest_streak(&self) -> Option<Streak> {
+        // The earliest of equally long ones.
+        self.streaks().into_iter().rev().max_by_key(|s| s.days())
+    }
+
+    pub fn best_day(&self) -> Option<(NaiveDate, u64)> {
+        self.days.iter().rev().max_by_key(|(_, &n)| n).map(|(&d, &n)| (d, n))
+    }
+
+    /// The best week (Monday it starts on, hits).
+    pub fn best_week(&self) -> Option<(NaiveDate, u64)> {
+        let mut weeks: BTreeMap<NaiveDate, u64> = BTreeMap::new();
+        for (&d, &n) in &self.days {
+            *weeks.entry(d - Duration::days(d.weekday().num_days_from_monday() as i64)).or_default() += n;
+        }
+        weeks.into_iter().rev().max_by_key(|&(_, n)| n)
+    }
+}
+
+fn local_date(minute: i64) -> NaiveDate {
+    Local.timestamp_opt(minute * 60, 0).single().map(|t| t.date_naive()).unwrap_or_default()
+}
+
+/// The longest run of days in a row within `days`.
+pub fn longest_run(days: &BTreeMap<NaiveDate, u64>) -> i64 {
+    let h = History { days: days.clone(), best_minute: None };
+    h.longest_streak().map(|s| s.days()).unwrap_or(0)
+}
+
+// ---- Harmony ----
+
+/// Chord shapes: (suffix, intervals from the root). Earlier ones win when a set of notes fits
+/// several (C E G A is Am7 rather than C6).
+const CHORDS: [(&str, &[u8]); 20] = [
+    ("", &[0, 4, 7]),
+    ("m", &[0, 3, 7]),
+    ("7", &[0, 4, 7, 10]),
+    ("m7", &[0, 3, 7, 10]),
+    ("maj7", &[0, 4, 7, 11]),
+    ("sus4", &[0, 5, 7]),
+    ("sus2", &[0, 2, 7]),
+    ("dim", &[0, 3, 6]),
+    ("aug", &[0, 4, 8]),
+    ("m7b5", &[0, 3, 6, 10]),
+    ("dim7", &[0, 3, 6, 9]),
+    ("6", &[0, 4, 7, 9]),
+    ("m6", &[0, 3, 7, 9]),
+    ("add9", &[0, 2, 4, 7]),
+    ("madd9", &[0, 2, 3, 7]),
+    ("9", &[0, 2, 4, 7, 10]),
+    ("maj9", &[0, 2, 4, 7, 11]),
+    ("m9", &[0, 2, 3, 7, 10]),
+    ("7sus4", &[0, 5, 7, 10]),
+    ("mMaj7", &[0, 3, 7, 11]),
+];
+
+/// The name of a set of pitch classes (bit 0 = C): "Am7", or its notes if it's no common chord.
+pub fn chord_name(mask: u16) -> String {
+    for (suffix, shape) in CHORDS {
+        for root in 0..12u16 {
+            let m: u16 = shape.iter().fold(0, |m, &i| m | 1 << ((root + i as u16) % 12));
+            if m == mask {
+                return format!("{}{}", NOTE_NAMES[root as usize], suffix);
+            }
+        }
+    }
+    (0..12).filter(|i| mask >> i & 1 == 1).map(|i| NOTE_NAMES[i]).collect::<Vec<_>>().join(" ")
+}
+
+/// Short names of intervals 0..=12 semitones.
+pub const INTERVALS: [&str; 13] = ["Unison", "m2", "M2", "m3", "M3", "P4", "Tritone", "P5", "m6", "M6", "m7", "M7", "Octave"];
+
+pub fn interval_name(semitones: usize) -> String {
+    match INTERVALS.get(semitones) {
+        Some(n) => n.to_string(),
+        None => format!("{semitones} semitones"),
+    }
 }
 
 pub const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -553,5 +838,88 @@ mod tests {
         assert_eq!(likely_scale(&pc).as_deref(), Some("E minor pentatonic"));
         assert_eq!(note_name(60), "C4");
         assert_eq!(gm_drum_name(42), Some("Closed Hi-Hat"));
+    }
+
+    #[test]
+    fn summaries() {
+        let mut h: BTreeMap<u16, u32> = BTreeMap::new();
+        h.insert(100, 1);
+        h.insert(120, 10);
+        h.insert(121, 4);
+        h.insert(140, 5);
+        let s = summarize(&h).unwrap();
+        assert_eq!(s.count, 20);
+        assert_eq!(s.median, 120.0);
+        assert_eq!(s.mode, 120.0);
+        assert!((s.mean - 124.2).abs() < 1e-9);
+        assert_eq!(summarize::<u16>(&BTreeMap::new()), None);
+
+        let mut v = [0u32; 128];
+        v[20] = 10;
+        v[100] = 90;
+        assert_eq!(quantile(&v, 0.1), Some(20));
+        assert_eq!(quantile(&v, 0.5), Some(100));
+        assert_eq!(average_velocity(&v), Some(92.0));
+    }
+
+    #[test]
+    fn chords_and_intervals() {
+        assert_eq!(chord_name(0b0000_1001_0001), "C");
+        assert_eq!(chord_name(0b0010_0001_0001), "Am");
+        assert_eq!(chord_name(0b0010_1001_0001), "Am7");
+        assert_eq!(chord_name(0b1000_1001_0001), "Cmaj7");
+        assert_eq!(chord_name(0b0000_1010_0001), "Csus4");
+        assert_eq!(chord_name(0b0000_0000_0111), "C C# D");
+        assert_eq!(interval_name(7), "P5");
+        assert_eq!(interval_name(14), "14 semitones");
+    }
+
+    #[test]
+    fn streaks_and_bests() {
+        let d = |day: u32| NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+        let mut h = History::default();
+        for (day, n) in [(1, 10), (2, 20), (3, 5), (5, 50), (6, 5), (9, 1), (10, 1)] {
+            h.days.insert(d(day), n);
+        }
+        assert_eq!(h.streaks().len(), 3);
+        assert_eq!(h.longest_streak(), Some(Streak { first: d(1), last: d(3) }));
+        assert_eq!(h.current_streak(d(11)), Some(Streak { first: d(9), last: d(10) }));
+        assert_eq!(h.current_streak(d(12)), None);
+        assert_eq!(h.best_day(), Some((d(5), 50)));
+        // Mon 2 Nov – Sun 8 Nov 2026: 20 + 5 + 50 + 5.
+        assert_eq!(h.best_week(), Some((d(2), 80)));
+        assert_eq!(longest_run(&h.days), 3);
+    }
+
+    #[test]
+    fn sessions_split_on_gaps() {
+        let dir = std::env::temp_dir().join(format!("modometer-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone());
+        store.create_profile("P").unwrap();
+        let start = local_to_minute(Local::now().naive_local().date().and_hms_opt(8, 0, 0).unwrap());
+        let mut minutes = BTreeMap::new();
+        for m in [0, 1, 2, 5, 30, 31] {
+            let mut c = MinuteCounts::default();
+            c.add_hit(60, 100);
+            c.add_hit(64, 50);
+            if m == 30 {
+                c.detail.tempo.insert(120, 2);
+                c.detail.timing = (2, 300);
+            }
+            minutes.insert(start + m, c);
+        }
+        store.append("P", &minutes).unwrap();
+        let s = compute(&store, "P", Query { span: Span::Day, offset: 0, bucket: Bucket::Hour }, &BTreeMap::new(), None);
+        assert_eq!(s.sessions.len(), 2);
+        assert_eq!((s.sessions[0].start, s.sessions[0].end, s.sessions[0].hits), (start, start + 6, 8));
+        assert_eq!(s.sessions[1].pitch_classes[4], 2);
+        assert_eq!(s.days.values().sum::<u64>(), 12);
+        assert_eq!(s.week_hours.iter().flatten().sum::<u64>(), 12);
+        assert_eq!(s.bucket_timing[8], (2, 300));
+        assert_eq!(s.bucket_tempo[8].get(&120), Some(&2));
+        assert_eq!(s.bucket_vels[8][100], 6);
+        assert_eq!(s.detail.tempo.get(&120), Some(&2));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

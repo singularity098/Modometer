@@ -22,19 +22,27 @@ forever, with stats. Vendor "Kaia". MIT.
 - Never modify audio or MIDI: audio is copied through, and there's no MIDI output bus, so the host
   passes MIDI on.
 - Storage: append-only per-month text logs, one line per minute (see Requirements). Velocity is kept.
+  Months older than last month are compacted to `YYYY-MM.log.gz` (flate2, pure-Rust miniz_oxide).
+- Analysis (tempo, timing against a grid fitted to the playing, rolls, chords, ...) runs on the
+  saver thread, never the audio thread. The hi-hat pedal (CC 4 via `IMidiMapping`) stays opt-in.
 - Look: plain near-black background, Jost, Xythos's Iris gradient (#c688d6, #a85eea, #7278fe).
 - Light on CPU: nothing on the audio thread but a ring-buffer push; the UI draws only on change.
 
 ## Layout
 
 ```
-src/store.rs        Log format, profiles, month files, totals cache
-src/session.rs      Per-instance state: RT ring buffer, pending minutes, autosave thread, profile switching
-src/stats.rs        Ranges and buckets in local time, note/velocity histograms, scale guess, GM drum names
-src/kit.rs          Per-profile settings.txt: drum map (note -> name) and retrigger guard
-src/ui/             The editor: baseview + femtovg (mod.rs), Drums view (kit.rs), colours and helpers (theme.rs)
+src/store.rs        Log format (counts + analysis fields), profiles, month files, compaction, totals cache
+src/session.rs      Per-instance state: RT ring buffer, pending minutes, saver thread (analysis, autosave,
+                    compaction, records), profile switching
+src/analyze.rs      Played tempo, grid fit, timing, swing, drift, rolls, fills, speed, chords, intervals
+src/stats.rs        Ranges and buckets in local time, histograms, summaries, sessions, history and streaks,
+                    scale guess, chord names, GM drum names
+src/kit.rs          Per-profile settings.txt: drum map (note -> name), retrigger guard, hi-hat pedal CC, roles
+src/ui/             The editor: baseview + femtovg (mod.rs: counter, overview), stats pages (pages.rs),
+                    Drums view (kit.rs), colours and helpers (theme.rs)
 src/vst3/           VST3 factory and component (mod.rs), editor view embedding (view.rs)
-examples/preview.rs     The window on its own with fake data; --stats, --kit, --screenshot <png>
+examples/preview.rs     The window on its own with fake data; --stats, --kit, --page <name>, --chart <name>,
+                        --profile <name>, --screenshot <png>
 examples/embed_test.rs  Embeds the editor via IPlugView into a parent window, like a host; --resize
 tests/vst3_host.rs      Drives the plugin through its VST3 interfaces
 scripts/bundle.sh       Builds "Modometer.vst3" (--install copies to ~/.vst3)

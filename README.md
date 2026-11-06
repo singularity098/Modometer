@@ -14,15 +14,29 @@ A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
   (or all time); which notes you play most (by pitch class or by note, with General MIDI drum names),
   your likely scale, and how hard you play (velocity).
 - **Time played**: how long you played in any range, notes a minute (average and busiest minute),
-  and the average per hour, day, week, month or year. The timeline can show time instead of notes.
-  A minute with only a few notes (the start or end of a session) counts as part of a minute,
-  measured against your usual pace (see "How time played is worked out" below).
+  and the average per hour, day, week, month or year. A minute with only a few notes (the start or
+  end of a session) counts as part of a minute, measured against your usual pace (see "How time
+  played is worked out" below). The timeline shows notes, time, average velocity, tempo or timing.
+- **Rhythm, no click needed**: the tempo you play at, worked out from your notes (and the project's
+  tempo while Reaper's transport plays), with the most common, median and average. **Timing**: how
+  far your notes land from an imagined grid that follows your own tempo, which drums sit ahead or
+  behind, your swing, and whether you speed up or slow down.
+- **Kit**: per drum, share of hits, a velocity histogram, ghost notes and accents, and drums you
+  hardly play; top speed, rolls and fills; ride vs hi-hat; how open you play the hi-hat (if you turn
+  on the hi-hat pedal). **Keys** profiles get chords, intervals, your range and the key of each
+  session instead.
+- **Habits**: your streak, a calendar of the year, when in the week you play, sessions, and
+  personal bests. **Review**: the highlights of any range, a "year in review" for a year.
+- The counter screen shows your streak, and celebrates milestones (1,000 notes, 10,000, ...,
+  1,000,000 ...), your best day and your busiest minute.
 - The window can be resized: drag the edge of the plugin window and everything scales, keeping its
   shape. Each instance remembers its size.
 - Very light: the audio thread only pushes a few bytes per note into a lock-free queue. The window
   draws only when something changes. Saves happen every 30 seconds, and only if you played.
 
 ![Stats](docs/images/stats.png)
+
+![Rhythm](docs/images/rhythm.png)
 
 ## Counting only what you play (Reaper)
 
@@ -55,6 +69,51 @@ Click **Drums** on the counter screen.
   usually come within 5–20 ms.
 
 The stats view's notes panel has a **Drums** tab with hits per named drum (unnamed notes as Other).
+
+- **Hi-hat pedal**: turn it on to read the pedal's position (MIDI CC 4) with every hi-hat hit, for
+  the Kit page's "how open" chart. It maps CC 4 to the plugin's "Hi-hat pedal" parameter. It's off
+  by default: check that your hi-hat still sounds right in Reaper with it on (the CC should still
+  reach your drum plugin).
+
+Naming your drums also tells Modometer the profile is a drum kit, which turns on the drum analysis
+(rolls, fills, per-drum dynamics and timing). Names like "Kick", "Snare", "Tom 1", "Hi-hat", "Ride"
+say what each drum is; unnamed notes count by their General MIDI meaning.
+
+## The stats pages
+
+- **Overview**: the timeline, notes and velocity.
+- **Rhythm**: tempo and timing (below).
+- **Kit** (drum profiles) or **Keys** (others).
+
+  ![Kit](docs/images/kit.png)
+
+  ![Keys](docs/images/keys.png)
+- **Habits**: streaks, the calendar (click a day to see it), when you play, sessions, personal bests.
+
+  ![Habits](docs/images/habits.png)
+- **Review**: the range at a glance. Pick **Year** for your year in review.
+
+  ![Review](docs/images/review.png)
+
+### How tempo and timing are worked out
+
+You don't need a click or the DAW's tempo. Every couple of seconds Modometer looks at the notes
+you just played (a few seconds either side of each): the gaps between them vote for the beat, with
+kick and snare counting most and hi-hats least, and tempos around 115 BPM preferred, so a groove
+with eighth-note hi-hats isn't taken for double time. Like any beat tracker it can't always tell
+a tempo from its half or double: very slow or very fast playing (below about 80 or above 160 BPM)
+may show at half or twice the tempo you'd count.
+
+Then it fits a grid of sixteenths (or triplets) to your notes, following your tempo and phase as
+you play. **Timing** is how far each note lands from the nearest grid line: steadiness, not whether
+you kept a tempo you never set. As a rough guide, under 6 ms is very tight, under 11 ms tight. Grace
+notes, flams and 32nds are left out, and so is free-time playing (no steady rhythm, no tempo).
+Per drum, the offsets show which drums you play ahead of or behind the others (a laid-back snare,
+say). **Swing** is where the off-beat lands in the beat: 50 % straight, 67 % triplet swing. **Drift**
+is how much the tempo rose or fell over a minute of steady playing.
+
+The **project tempo** (Played / Project on the Rhythm page) is Reaper's tempo, logged only while
+the transport plays.
 
 ### How time played is worked out
 
@@ -108,7 +167,12 @@ Each month is one small text file you can read or back up, one line per minute y
 ```
 
 That's the UTC minute, the number of notes, then how often each note (`n`) and each velocity (`v`)
-came up. Files are only ever appended to. See [docs/Requirements.md](docs/Requirements.md) for why.
+came up. More fields follow with the analysis (tempo, timing, ...), listed in
+[docs/Requirements.md](docs/Requirements.md). Files are only ever appended to.
+
+When a month is over (from the month after next), Modometer compacts it: one line per minute,
+gzipped, as `2026-09.log.gz`. Read it with `zcat` or `zless`. That keeps a year of playing to a few
+MB and one file per month. Older versions of the plugin don't read compacted months.
 
 ## Development
 
@@ -121,7 +185,9 @@ cargo run --example preview
 ```
 
 `preview` opens the window on its own with made-up data (`--stats` or `--kit` to start on the stats
-or drums view, `--screenshot file.png` to save a frame and exit). `embed_test` (`-- 6 --resize` to test resizing) embeds the editor into a parent
+or drums view, `--page rhythm|kit|habits|review` for a stats page, `--chart velocity|tempo|timing`
+for the timeline, `--profile Drums` for the drum kit, `--screenshot file.png` to save a frame and
+exit). `embed_test` (`-- 6 --resize` to test resizing) embeds the editor into a parent
 window through the VST3 view interface, as a host does.
 
 ## License
