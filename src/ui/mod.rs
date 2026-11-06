@@ -7,12 +7,13 @@
 //! and mouse movement redraws only when what's under the mouse changes.
 
 mod kit;
+mod pages;
 pub mod theme;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use baseview::gl::{GlConfig, GlContext};
 use baseview::{
@@ -24,8 +25,8 @@ use femtovg::{Align, Baseline, Canvas, Color, FontId, Paint, Path};
 use keyboard_types::{Key, KeyState, NamedKey};
 
 use crate::kit::{Kit, RETRIGGER_CHOICES};
-use crate::session::{Shared, Snapshot};
-use crate::stats::{self, Bucket, Query, Span, Stats};
+use crate::session::{Cheer, Shared, Snapshot};
+use crate::stats::{self, Bucket, History, Query, Span, Stats};
 use theme::{commas, WithAlpha, HEIGHT, WIDTH};
 
 #[derive(Clone, Default)]
@@ -36,6 +37,10 @@ pub struct Options {
     pub start_in_stats: bool,
     /// Open on the drums view (for the preview tool).
     pub start_in_kit: bool,
+    /// The stats page to open on, by name: overview, rhythm, kit, habits, review (preview tool).
+    pub page: Option<String>,
+    /// What the timeline shows, by name: notes, time, velocity, tempo, timing (preview tool).
+    pub chart: Option<String>,
 }
 
 /// Window settings to try, best first: multisampled, then plain (some drivers and virtual displays
@@ -89,6 +94,11 @@ enum Action {
     Next,
     NoteMode(NoteMode),
     ChartMode(ChartMode),
+    Page(Page),
+    TempoSource(TempoSource),
+    TogglePedal,
+    /// Show one day (days from today) on the overview.
+    ShowDay(i32),
     ShowKit,
     Learn,
     /// Open the naming dialog for a note.
@@ -115,18 +125,53 @@ enum NoteMode {
     Drums,
 }
 
+impl NoteMode {
+    /// Drums for a drum kit, pitch classes for anything else.
+    fn default_for(kit: &Kit) -> NoteMode {
+        if kit.is_drums() { NoteMode::Drums } else { NoteMode::PitchClass }
+    }
+}
+
 /// What the timeline shows per bucket.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ChartMode {
     Notes,
     Time,
+    Velocity,
+    Tempo,
+    Timing,
+}
+
+/// The stats view's pages.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Page {
+    Overview,
+    Rhythm,
+    Kit,
+    Habits,
+    Review,
+}
+
+/// Which tempo the rhythm page shows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TempoSource {
+    Played,
+    Project,
 }
 
 /// A profile's pace (see `stats::pace`), and the minute it was worked out.
 type PaceCache = Option<(String, i64, Option<f64>)>;
+/// A profile's history, and when it was worked out.
+type HistoryCache = Option<(String, Instant, Arc<History>)>;
+/// What the loading thread hands over.
+type Loaded = (Stats, Arc<History>);
 
 /// How long a cached pace is used before it's worked out again, in minutes.
 const PACE_MAX_AGE: i64 = 60;
+/// How long a cached history is used.
+const HISTORY_MAX_AGE: Duration = Duration::from_secs(120);
+/// How long the counter's celebration sparkles.
+const CHEER_ANIMATION: Duration = Duration::from_millis(2600);
 
 enum Overlay {
     None,
@@ -154,11 +199,18 @@ struct Ui {
     profiles: Vec<String>,
     query: Query,
     stats: Option<Stats>,
-    incoming: Arc<Mutex<Option<Stats>>>,
+    history: Option<Arc<History>>,
+    incoming: Arc<Mutex<Option<Loaded>>>,
     loading: bool,
     pace: Arc<Mutex<PaceCache>>,
+    history_cache: Arc<Mutex<HistoryCache>>,
     note_mode: NoteMode,
     chart_mode: ChartMode,
+    page: Page,
+    tempo_source: TempoSource,
+    /// The celebration last shown, and when its sparkle started.
+    cheer: Option<Cheer>,
+    cheer_started: Option<Instant>,
     /// The mouse cursor last set on the window.
     cursor: MouseCursor,
     kit: Kit,
@@ -199,7 +251,15 @@ impl Editor {
         let _ = ctx.set_mouse_cursor(MouseCursor::Default);
 
         let snapshot = shared.snapshot();
+        let cheer = snapshot.cheer.clone();
         let span = Span::Week;
+        let page = match options.page.as_deref() {
+            Some("rhythm") => Page::Rhythm,
+            Some("kit") => Page::Kit,
+            Some("habits") => Page::Habits,
+            Some("review") => Page::Review,
+            _ => Page::Overview,
+        };
         let ui = Ui {
             view: if options.start_in_stats {
                 View::Stats
@@ -219,11 +279,24 @@ impl Editor {
             profiles: shared.store().list_profiles(),
             query: Query { span, offset: 0, bucket: span.default_bucket() },
             stats: None,
+            history: None,
             incoming: Arc::new(Mutex::new(None)),
             loading: false,
             pace: Arc::new(Mutex::new(None)),
-            note_mode: NoteMode::PitchClass,
-            chart_mode: ChartMode::Notes,
+            history_cache: Arc::new(Mutex::new(None)),
+            note_mode: NoteMode::default_for(&shared.kit()),
+            chart_mode: match options.chart.as_deref() {
+                Some("time") => ChartMode::Time,
+                Some("velocity") => ChartMode::Velocity,
+                Some("tempo") => ChartMode::Tempo,
+                Some("timing") => ChartMode::Timing,
+                _ => ChartMode::Notes,
+            },
+            page,
+            tempo_source: TempoSource::Played,
+            // Already passed when the window opened: no sparkle.
+            cheer,
+            cheer_started: None,
             kit: shared.kit(),
             cursor: MouseCursor::Default,
             kit_scroll: 0,
@@ -273,6 +346,7 @@ impl Editor {
         let waker = self.ctx.waker();
         let query = ui.query;
         let pace_cache = Arc::clone(&ui.pace);
+        let history_cache = Arc::clone(&ui.history_cache);
         std::thread::spawn(move || {
             let pending = shared.pending();
             let profile = shared.profile_name();
@@ -287,7 +361,16 @@ impl Editor {
                 }
             };
             let s = stats::compute(shared.store(), &profile, query, &pending, pace);
-            *incoming.lock().unwrap() = Some(s);
+            let cached = history_cache.lock().unwrap().clone();
+            let history = match cached {
+                Some((p, at, h)) if p == profile && at.elapsed() < HISTORY_MAX_AGE => h,
+                _ => {
+                    let h = Arc::new(History::compute(shared.store(), &profile, &pending));
+                    *history_cache.lock().unwrap() = Some((profile.clone(), Instant::now(), Arc::clone(&h)));
+                    h
+                }
+            };
+            *incoming.lock().unwrap() = Some((s, history));
             waker.request_redraw();
         });
     }
@@ -307,6 +390,7 @@ impl Editor {
             Action::CloseOverlay => ui.overlay = Overlay::None,
             Action::SelectProfile(name) => {
                 self.shared.select_profile(&name);
+                ui.note_mode = NoteMode::default_for(&self.shared.kit());
                 ui.overlay = Overlay::None;
                 if ui.view == View::Stats {
                     self.load_stats(ui);
@@ -343,6 +427,18 @@ impl Editor {
             }
             Action::NoteMode(mode) => ui.note_mode = mode,
             Action::ChartMode(mode) => ui.chart_mode = mode,
+            Action::Page(page) => ui.page = page,
+            Action::ShowDay(offset) => {
+                ui.query = Query { span: Span::Day, offset: offset.min(0), bucket: Span::Day.default_bucket() };
+                ui.page = Page::Overview;
+                self.load_stats(ui);
+            }
+            Action::TempoSource(source) => ui.tempo_source = source,
+            Action::TogglePedal => {
+                let cc = if self.shared.pedal_cc() == 0 { crate::kit::PEDAL_CC } else { 0 };
+                self.shared.set_pedal_cc(cc);
+                ui.kit = self.shared.kit();
+            }
             Action::ShowKit => ui.view = View::Kit,
             Action::Learn => {
                 ui.overlay = Overlay::Learn { since: self.shared.recent_seq() };
@@ -444,6 +540,7 @@ impl Editor {
             .with_text_baseline(Baseline::Middle)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn text(&self, c: &mut Canvas<OpenGl>, x: f32, y: f32, s: &str, size: f32, color: Color, align: Align) -> f32 {
         let paint = self.paint_text(size, 300.0, color, align);
         c.fill_text(x, y, s, &paint).map(|m| m.width()).unwrap_or(0.0)
@@ -584,8 +681,39 @@ impl Editor {
         let _ = c.fill_text(cx, cy, &s, &paint);
 
         self.label(c, cx, 300.0, "notes played", theme::dim(), Align::Center);
-        let today = format!("Today  {}", commas(ui.snapshot.today));
+        let mut today = format!("Today  {}", commas(ui.snapshot.today));
+        if ui.snapshot.streak >= 2 {
+            today.push_str(&format!("   ·   {}-day streak", ui.snapshot.streak));
+        }
         self.text(c, cx, 332.0, &today, 14.0, theme::faint().with_alpha(170), Align::Center);
+
+        if let Some(cheer) = &ui.snapshot.cheer {
+            let s = match cheer {
+                Cheer::Milestone(m) => format!("{} notes!", commas(*m)),
+                Cheer::BestDay => "Your best day yet".to_string(),
+                Cheer::BestMinute(n) => format!("Your busiest minute yet: {} notes", commas(*n)),
+            };
+            let sw = self.measure(c, &s, 16.0, 300.0);
+            self.gradient_text(c, cx, 372.0, &s, 16.0, sw, Align::Center);
+        }
+        if let Some(t) = ui.cheer_started.filter(|t| t.elapsed() < CHEER_ANIMATION) {
+            Self::sparkle(c, cx, cy, t.elapsed().as_secs_f32() / CHEER_ANIMATION.as_secs_f32());
+        }
+    }
+
+    /// A burst of sparks from (x, y), `k` from 0 (start) to 1 (gone).
+    fn sparkle(c: &mut Canvas<OpenGl>, x: f32, y: f32, k: f32) {
+        let ease = 1.0 - (1.0 - k).powi(3);
+        let alpha = ((1.0 - k) * 255.0) as u8;
+        for i in 0..28 {
+            let a = i as f32 / 28.0 * std::f32::consts::TAU + (i % 3) as f32 * 0.21;
+            let reach = 150.0 + (i % 5) as f32 * 34.0;
+            let (dx, dy) = (a.cos() * reach * ease * 1.6, a.sin() * reach * ease * 0.7);
+            let mut p = Path::new();
+            p.circle(x + dx, y + dy, 1.2 + (i % 4) as f32 * 0.6 * (1.0 - k));
+            let col = [theme::PINK, theme::VIOLET, theme::INDIGO][i % 3];
+            c.fill_path(&p, &Paint::color(Color::rgba(col.0, col.1, col.2, alpha)));
+        }
     }
 
     fn draw_profiles(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, scroll: &mut usize) {
@@ -687,7 +815,7 @@ impl Editor {
             None
         };
         // Wide slots get a narrower bar, centred.
-        let bar_w = (slot - gap).max(0.6).min(44.0);
+        let bar_w = (slot - gap).clamp(0.6, 44.0);
         let inset = (slot - bar_w) / 2.0;
         let mut path = Path::new();
         for (i, &v) in values.iter().enumerate() {
@@ -744,19 +872,19 @@ impl Editor {
 
     fn draw_stats(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
         let w = WIDTH as f32;
-        // Top bar: back, profile, spans.
+        // Top bar: back, profile, pages.
         self.top_bar(c, ui);
-
+        let kit_page = if ui.kit.is_drums() { "Kit" } else { "Keys" };
+        let pages = [(Page::Overview, "Overview"), (Page::Rhythm, "Rhythm"), (Page::Kit, kit_page), (Page::Habits, "Habits"), (Page::Review, "Review")];
         let mut x = w - 16.0;
-        for span in stats::SPANS.iter().rev() {
-            let bw = 58.0;
+        for (page, name) in pages.iter().rev() {
+            let bw = if *page == Page::Overview { 76.0 } else { 64.0 };
             x -= bw;
-            let selected = ui.query.span == *span;
-            self.button(c, ui, Rect::new(x, 12.0, bw, 32.0), span.label(), selected, Action::Span(*span));
+            self.button(c, ui, Rect::new(x, 12.0, bw, 32.0), name, ui.page == *page, Action::Page(*page));
         }
         Self::hline(c, 16.0, w - 16.0, 52.0, theme::hairline());
 
-        // Range row: ‹ title › on the left, bucket choice on the right.
+        // Range row: ‹ title › and notes on the left, the span on the right.
         let q = ui.query;
         let (title, total) = match &ui.stats {
             Some(s) => (s.title.clone(), s.total),
@@ -764,7 +892,7 @@ impl Editor {
         };
         let mut x = 16.0;
         if q.span != Span::All {
-            let r = Rect::new(x, 62.0, 28.0, 30.0);
+            let r = Rect::new(x, 60.0, 28.0, 30.0);
             let hovered = r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
             if hovered {
                 Self::rounded(c, r, 4.0, Some(theme::hover_fill()), None);
@@ -773,11 +901,11 @@ impl Editor {
             ui.regions.push((r, Action::Prev));
             x += 32.0;
         }
-        let tw = self.text(c, x + 4.0, 77.0, &title, 15.0, theme::text(), Align::Left);
+        let tw = self.text(c, x + 4.0, 75.0, &title, 15.0, theme::text(), Align::Left);
         x += tw + 12.0;
         if q.span != Span::All {
             let enabled = q.offset < 0;
-            let r = Rect::new(x, 62.0, 28.0, 30.0);
+            let r = Rect::new(x, 60.0, 28.0, 30.0);
             let hovered = enabled && r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
             if hovered {
                 Self::rounded(c, r, 4.0, Some(theme::hover_fill()), None);
@@ -788,107 +916,248 @@ impl Editor {
                 ui.regions.push((r, Action::Next));
             }
         }
+        let mut sx = w - 16.0;
+        for span in stats::SPANS.iter().rev() {
+            let bw = 52.0;
+            sx -= bw;
+            self.button(c, ui, Rect::new(sx, 60.0, bw, 30.0), span.label(), q.span == *span, Action::Span(*span));
+        }
         if ui.stats.is_some() {
             let total_s = format!("{} notes", commas(total));
             let tx = x + if q.span != Span::All { 44.0 } else { 8.0 };
-            let paint = theme::gradient(tx, 0.0, tx + 160.0, 0.0, 255)
-                .with_font(&[self.font])
-                .with_font_size(15.0)
-                .with_font_weight(300.0)
-                .with_text_baseline(Baseline::Middle);
-            let _ = c.fill_text(tx, 77.0, &total_s, &paint);
-        }
-        let buckets = q.span.buckets();
-        let mut bx = w - 16.0;
-        for b in buckets.iter().rev() {
-            let bw = 62.0;
-            bx -= bw;
-            self.button(c, ui, Rect::new(bx, 62.0, bw, 30.0), b.label(), q.bucket == *b, Action::Bucket(*b));
-        }
-        if buckets.len() > 1 {
-            self.label(c, bx - 8.0, 77.0, "by", theme::faint(), Align::Right);
-        }
-
-        // Time played, pace and averages; what the timeline shows.
-        if let Some(s) = &ui.stats {
-            if s.total > 0 {
-                let mut x = 16.0;
-                let limit = w - 16.0 - 110.0;
-                for (i, (text, tip)) in summary(s).into_iter().enumerate() {
-                    let sep = if i > 0 { "  ·  " } else { "" };
-                    let sep_w = self.measure(c, sep, 12.5, 300.0);
-                    let tw = self.measure(c, &text, 12.5, 300.0);
-                    if x + sep_w + tw > limit {
-                        break;
-                    }
-                    self.text(c, x, 108.0, sep, 12.5, theme::faint(), Align::Left);
-                    x += sep_w;
-                    self.text(c, x, 108.0, &text, 12.5, theme::dim(), Align::Left);
-                    if let Some((title, value)) = tip {
-                        ui.tips.push((Rect::new(x, 98.0, tw, 20.0), format!("{title}\n{value}")));
-                    }
-                    x += tw;
-                }
+            if tx + self.measure(c, &total_s, 15.0, 300.0) < sx - 8.0 {
+                self.gradient_text(c, tx, 75.0, &total_s, 15.0, 160.0, Align::Left);
             }
         }
-        let rt = Rect::new(w - 16.0 - 46.0, 96.0, 46.0, 24.0);
-        let rn = Rect::new(rt.x - 52.0, 96.0, 50.0, 24.0);
-        let mode = ui.chart_mode;
-        self.small_toggle(c, ui, rn, "Notes", mode == ChartMode::Notes, Action::ChartMode(ChartMode::Notes));
-        self.small_toggle(c, ui, rt, "Time", mode == ChartMode::Time, Action::ChartMode(ChartMode::Time));
 
-        // Timeline.
-        let chart = Rect::new(60.0, 130.0, w - 76.0, 126.0);
         let loading_alpha = if ui.loading { 0.5 } else { 1.0 };
         c.save();
         c.set_global_alpha(loading_alpha);
-
         if let Some(stats) = ui.stats.take() {
-            let time = ui.chart_mode == ChartMode::Time;
-            // In time mode the bars are seconds of (estimated) playing.
-            let values: Vec<u64> = if time {
-                stats.played.iter().map(|&m| (m * 60.0).round() as u64).collect()
-            } else {
-                stats.counts.clone()
-            };
-            let max = values.iter().copied().max().unwrap_or(0);
-            let axis = |v: u64| if time { theme::short_duration(v as f64 / 60.0) } else { theme::short(v) };
-            Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h, theme::hairline());
-            Self::hline(c, chart.x, chart.x + chart.w, chart.y, theme::hairline().with_alpha(10));
-            Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h / 2.0, theme::hairline().with_alpha(10));
-            if max > 0 {
-                self.text(c, chart.x - 8.0, chart.y, &axis(max), 11.0, theme::faint(), Align::Right);
-                self.text(c, chart.x - 8.0, chart.y + chart.h / 2.0, &axis(max / 2), 11.0, theme::faint(), Align::Right);
+            match ui.page {
+                Page::Overview => self.draw_overview(c, ui, &stats),
+                Page::Rhythm => self.draw_rhythm(c, ui, &stats),
+                Page::Kit if ui.kit.is_drums() => self.draw_kit_stats(c, ui, &stats),
+                Page::Kit => self.draw_keys_stats(c, ui, &stats),
+                Page::Habits => self.draw_habits(c, ui, &stats),
+                Page::Review => self.draw_review(c, ui, &stats),
             }
-            self.text(c, chart.x - 8.0, chart.y + chart.h, "0", 11.0, theme::faint(), Align::Right);
-            let n = stats.counts.len();
-            let stats_ref = &stats;
-            self.bars_with(c, ui, chart, &values, &|i| {
-                let s = stats_ref;
-                let played = played_text(s.played[i], s.logged[i], s.pace.is_some(), s.query.bucket == Bucket::Minute);
-                let value = match (time, s.counts[i]) {
-                    (_, 0) => "Not played".to_string(),
-                    (true, _) => played,
-                    (false, n) if s.query.bucket == Bucket::Minute => format!("{} notes", commas(n)),
-                    (false, n) => format!("{} notes · {} · up to {} a minute", commas(n), played, commas(s.peak[i])),
-                };
-                (s.bucket_label(i), value)
-            });
-            // Axis labels: about six, evenly spread.
-            let step = (n as f32 / 6.0).ceil().max(1.0) as usize;
-            let slot = chart.w / n.max(1) as f32;
-            for i in (0..n).step_by(step) {
-                self.text(c, chart.x + i as f32 * slot + slot / 2.0, chart.y + chart.h + 14.0, &stats.axis_label(i), 11.0, theme::faint(), Align::Center);
-            }
-            if stats.total == 0 && !ui.loading {
-                self.text(c, chart.x + chart.w / 2.0, chart.y + chart.h / 2.0, "No notes in this range", 14.0, theme::dim(), Align::Center);
-            }
-
-            self.draw_notes(c, ui, &stats, Rect::new(16.0, 296.0, 470.0, 140.0));
-            self.draw_velocity(c, ui, &stats, Rect::new(500.0, 296.0, w - 516.0, 140.0));
             ui.stats = Some(stats);
         }
         c.restore();
+    }
+
+    /// A line of parts separated by dots, each with an optional tooltip; parts that don't fit
+    /// before `limit` are dropped.
+    fn parts_line(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, x: f32, y: f32, limit: f32, parts: Vec<(String, Option<(String, String)>)>) {
+        let mut x = x;
+        for (i, (text, tip)) in parts.into_iter().enumerate() {
+            let sep = if i > 0 { "  ·  " } else { "" };
+            let sep_w = self.measure(c, sep, 12.5, 300.0);
+            let tw = self.measure(c, &text, 12.5, 300.0);
+            if x + sep_w + tw > limit {
+                break;
+            }
+            self.text(c, x, y, sep, 12.5, theme::faint(), Align::Left);
+            x += sep_w;
+            self.text(c, x, y, &text, 12.5, theme::dim(), Align::Left);
+            if let Some((title, value)) = tip {
+                ui.tips.push((Rect::new(x, y - 10.0, tw, 20.0), format!("{title}\n{value}")));
+            }
+            x += tw;
+        }
+    }
+
+    fn draw_overview(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats) {
+        let w = WIDTH as f32;
+        let q = ui.query;
+        // Time played, pace and averages.
+        if stats.total > 0 {
+            self.parts_line(c, ui, 16.0, 106.0, w - 16.0, summary(stats));
+        }
+
+        // Bucket size on the left, what the timeline shows on the right.
+        let buckets = q.span.buckets();
+        let mut bx = 16.0;
+        if buckets.len() > 1 {
+            self.label(c, bx, 134.0, "by", theme::faint(), Align::Left);
+            bx += 24.0;
+            for b in buckets {
+                let r = Rect::new(bx, 122.0, 58.0, 24.0);
+                self.small_toggle(c, ui, r, b.label(), q.bucket == *b, Action::Bucket(*b));
+                bx += 60.0;
+            }
+        }
+        let modes = [
+            (ChartMode::Notes, "Notes", 52.0),
+            (ChartMode::Time, "Time", 46.0),
+            (ChartMode::Velocity, "Velocity", 66.0),
+            (ChartMode::Tempo, "Tempo", 54.0),
+            (ChartMode::Timing, "Timing", 56.0),
+        ];
+        let mut mx = w - 16.0;
+        for (mode, name, mw) in modes.iter().rev() {
+            mx -= mw;
+            self.small_toggle(c, ui, Rect::new(mx, 122.0, *mw, 24.0), name, ui.chart_mode == *mode, Action::ChartMode(*mode));
+            mx -= 2.0;
+        }
+
+        // Timeline.
+        let chart = Rect::new(60.0, 156.0, w - 76.0, 104.0);
+        Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h, theme::hairline());
+        Self::hline(c, chart.x, chart.x + chart.w, chart.y, theme::hairline().with_alpha(10));
+        Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h / 2.0, theme::hairline().with_alpha(10));
+        let n = stats.counts.len();
+        match ui.chart_mode {
+            ChartMode::Notes | ChartMode::Time => {
+                let time = ui.chart_mode == ChartMode::Time;
+                // In time mode the bars are seconds of (estimated) playing.
+                let values: Vec<u64> = if time {
+                    stats.played.iter().map(|&m| (m * 60.0).round() as u64).collect()
+                } else {
+                    stats.counts.clone()
+                };
+                let max = values.iter().copied().max().unwrap_or(0);
+                let axis = |v: u64| if time { theme::short_duration(v as f64 / 60.0) } else { theme::short(v) };
+                if max > 0 {
+                    self.text(c, chart.x - 8.0, chart.y, &axis(max), 11.0, theme::faint(), Align::Right);
+                    self.text(c, chart.x - 8.0, chart.y + chart.h / 2.0, &axis(max / 2), 11.0, theme::faint(), Align::Right);
+                }
+                self.text(c, chart.x - 8.0, chart.y + chart.h, "0", 11.0, theme::faint(), Align::Right);
+                self.bars_with(c, ui, chart, &values, &|i| {
+                    let s = stats;
+                    let played = played_text(s.played[i], s.logged[i], s.pace.is_some(), s.query.bucket == Bucket::Minute);
+                    let value = match (time, s.counts[i]) {
+                        (_, 0) => "Not played".to_string(),
+                        (true, _) => played,
+                        (false, n) if s.query.bucket == Bucket::Minute => format!("{} notes", commas(n)),
+                        (false, n) => format!("{} notes · {} · up to {} a minute", commas(n), played, commas(s.peak[i])),
+                    };
+                    (s.bucket_label(i), value)
+                });
+            }
+            ChartMode::Velocity => {
+                let values: Vec<Option<f64>> = stats.bucket_vels.iter().map(stats::average_velocity).collect();
+                self.series(c, ui, chart, &values, Some((0.0, 127.0)), &|v| format!("{v:.0}"), &|i| {
+                    let v = &stats.bucket_vels[i];
+                    let value = match (stats::average_velocity(v), stats::quantile(v, 0.1), stats::quantile(v, 0.9)) {
+                        (Some(a), Some(lo), Some(hi)) => format!("average {a:.0} · most between {lo} and {hi}"),
+                        _ => "Not played".to_string(),
+                    };
+                    (stats.bucket_label(i), value)
+                });
+            }
+            ChartMode::Tempo => {
+                let values: Vec<Option<f64>> = stats.bucket_tempo.iter().map(|t| stats::summarize(t).map(|s| s.median)).collect();
+                self.series(c, ui, chart, &values, None, &|v| format!("{v:.0}"), &|i| {
+                    let value = match stats::summarize(&stats.bucket_tempo[i]) {
+                        Some(s) => format!("{:.0} BPM (median) · most {:.0}", s.median, s.mode),
+                        None if stats.counts[i] > 0 => "No steady tempo".to_string(),
+                        None => "Not played".to_string(),
+                    };
+                    (stats.bucket_label(i), value)
+                });
+            }
+            ChartMode::Timing => {
+                let values: Vec<Option<f64>> = stats.bucket_timing.iter().map(|&(n, sum)| (n > 0).then(|| sum as f64 / n as f64 / 10.0)).collect();
+                self.series(c, ui, chart, &values, None, &|v| format!("{v:.1} ms"), &|i| {
+                    let (n, sum) = stats.bucket_timing[i];
+                    let value = if n > 0 {
+                        format!("{:.1} ms from the grid, on average ({} notes)", sum as f64 / n as f64 / 10.0, commas(n as u64))
+                    } else if stats.counts[i] > 0 {
+                        "No steady rhythm to measure".to_string()
+                    } else {
+                        "Not played".to_string()
+                    };
+                    (stats.bucket_label(i), value)
+                });
+            }
+        }
+        // Axis labels: about six, evenly spread.
+        let step = (n as f32 / 6.0).ceil().max(1.0) as usize;
+        let slot = chart.w / n.max(1) as f32;
+        for i in (0..n).step_by(step) {
+            self.text(c, chart.x + i as f32 * slot + slot / 2.0, chart.y + chart.h + 14.0, &stats.axis_label(i), 11.0, theme::faint(), Align::Center);
+        }
+        if stats.total == 0 && !ui.loading {
+            self.text(c, chart.x + chart.w / 2.0, chart.y + chart.h / 2.0, "No notes in this range", 14.0, theme::dim(), Align::Center);
+        }
+
+        self.draw_notes(c, ui, stats, Rect::new(16.0, 292.0, 470.0, 144.0));
+        self.draw_velocity(c, ui, stats, Rect::new(500.0, 292.0, w - 516.0, 144.0));
+    }
+
+    /// Values per bucket as dots joined by a line (gaps where there's no value), on a scale fitted
+    /// to them (or `fixed`). `tip` gives each bucket's tooltip title and value.
+    #[allow(clippy::too_many_arguments)]
+    fn series(
+        &self,
+        c: &mut Canvas<OpenGl>,
+        ui: &mut Ui,
+        area: Rect,
+        values: &[Option<f64>],
+        fixed: Option<(f64, f64)>,
+        axis: &dyn Fn(f64) -> String,
+        tip: &dyn Fn(usize) -> (String, String),
+    ) {
+        let n = values.len().max(1);
+        let present: Vec<f64> = values.iter().flatten().copied().collect();
+        let slot = area.w / n as f32;
+        let hovered = if area.contains(ui.mouse) && matches!(ui.overlay, Overlay::None) {
+            Some((((ui.mouse.0 - area.x) / slot) as usize).min(n - 1))
+        } else {
+            None
+        };
+        if let Some(i) = hovered {
+            let mut col = Path::new();
+            col.rect(area.x + i as f32 * slot, area.y, slot.max(1.0), area.h);
+            c.fill_path(&col, &Paint::color(theme::hover_fill()));
+        }
+        for i in 0..n.min(values.len()) {
+            let (title, value) = tip(i);
+            ui.tips.push((Rect::new(area.x + i as f32 * slot, area.y, slot, area.h), format!("{title}\n{value}")));
+        }
+        if present.is_empty() {
+            return;
+        }
+        let (lo, hi) = fixed.unwrap_or_else(|| {
+            let lo = present.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = present.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let pad = ((hi - lo) * 0.15).max(hi.abs() * 0.05).max(1.0);
+            ((lo - pad).max(0.0), hi + pad)
+        });
+        let y_of = |v: f64| area.y + area.h - ((v - lo) / (hi - lo).max(1e-9)) as f32 * area.h;
+        self.text(c, area.x - 8.0, area.y, &axis(hi), 11.0, theme::faint(), Align::Right);
+        self.text(c, area.x - 8.0, area.y + area.h / 2.0, &axis((lo + hi) / 2.0), 11.0, theme::faint(), Align::Right);
+        self.text(c, area.x - 8.0, area.y + area.h, &axis(lo), 11.0, theme::faint(), Align::Right);
+        let mut line = Path::new();
+        let mut dots = Path::new();
+        let mut prev = false;
+        let r = (slot * 0.3).clamp(1.2, 3.0);
+        for (i, v) in values.iter().enumerate() {
+            match v {
+                Some(v) => {
+                    let (x, y) = (area.x + i as f32 * slot + slot / 2.0, y_of(*v));
+                    if prev {
+                        line.line_to(x, y);
+                    } else {
+                        line.move_to(x, y);
+                    }
+                    dots.circle(x, y, r);
+                    prev = true;
+                }
+                None => prev = false,
+            }
+        }
+        let paint = theme::gradient(area.x, area.y, area.x + area.w, area.y + area.h, 200);
+        c.stroke_path(&line, &paint.clone().with_line_width(1.2));
+        c.fill_path(&dots, &paint);
+        if let Some(Some(v)) = hovered.map(|i| values[i]) {
+            let i = hovered.unwrap_or(0);
+            let mut p = Path::new();
+            p.circle(area.x + i as f32 * slot + slot / 2.0, y_of(v), r + 1.5);
+            c.fill_path(&p, &Paint::color(Color::rgba(255, 255, 255, 200)));
+        }
     }
 
     fn draw_notes(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats, panel: Rect) {
@@ -997,12 +1266,26 @@ impl Editor {
 
         let mut ui = self.ui.borrow_mut();
         let ui = &mut *ui;
-        if let Some(s) = ui.incoming.lock().unwrap().take() {
+        if let Some((s, h)) = ui.incoming.lock().unwrap().take() {
             ui.stats = Some(s);
+            ui.history = Some(h);
             ui.loading = false;
         }
         ui.snapshot = self.shared.snapshot();
         ui.kit = self.shared.kit();
+        // A new celebration sparkles (a busier minute than the last busiest doesn't again).
+        let kind = |c: &Option<Cheer>| match c {
+            Some(Cheer::Milestone(m)) => Some((0, *m)),
+            Some(Cheer::BestDay) => Some((1, 0)),
+            Some(Cheer::BestMinute(_)) => Some((2, 0)),
+            None => None,
+        };
+        if kind(&ui.snapshot.cheer) != kind(&ui.cheer) {
+            if ui.snapshot.cheer.is_some() {
+                ui.cheer_started = Some(Instant::now());
+            }
+            ui.cheer = ui.snapshot.cheer.clone();
+        }
         ui.regions.clear();
         ui.tips.clear();
         match ui.view {
@@ -1141,6 +1424,7 @@ impl WindowHandler for Editor {
         let hits = self.shared.hits_seen();
         let generation = self.shared.generation.load(std::sync::atomic::Ordering::Relaxed);
         let stats_ready = ui.incoming.lock().map(|s| s.is_some()).unwrap_or(false);
+        let sparkling = ui.cheer_started.is_some_and(|t| t.elapsed() < CHEER_ANIMATION + Duration::from_millis(100));
         let recent = self.shared.recent_seq();
         let recent_changed = recent != ui.seen_recent;
         if recent_changed {
@@ -1149,7 +1433,7 @@ impl WindowHandler for Editor {
         }
         // Ignored hits matter only where the monitor or a learn dialog shows them.
         let recent_shown = recent_changed && (ui.view == View::Kit || !matches!(ui.overlay, Overlay::None));
-        if hits != ui.seen_hits || generation != ui.seen_generation || stats_ready || recent_shown {
+        if hits != ui.seen_hits || generation != ui.seen_generation || stats_ready || recent_shown || sparkling {
             ui.seen_hits = hits;
             ui.seen_generation = generation;
             self.ctx.request_redraw();
