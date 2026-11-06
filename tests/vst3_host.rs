@@ -123,7 +123,11 @@ fn host_round_trip() {
         let controller = component.cast::<IEditController>().unwrap();
         assert_eq!(component.getBusCount(MediaTypes_::kEvent as i32, BusDirections_::kInput as i32), 1);
         assert_eq!(component.getBusCount(MediaTypes_::kEvent as i32, BusDirections_::kOutput as i32), 0);
-        assert_eq!(controller.getParameterCount(), 0);
+        // One parameter, the hi-hat pedal, mapped from MIDI only when the profile reads it.
+        assert_eq!(controller.getParameterCount(), 1);
+        let mapping = component.cast::<IMidiMapping>().unwrap();
+        let mut id = 99;
+        assert_eq!(mapping.getMidiControllerAssignment(0, 0, 4, &mut id), kResultFalse);
 
         let mut setup = ProcessSetup {
             processMode: ProcessModes_::kRealtime as i32,
@@ -156,6 +160,10 @@ fn host_round_trip() {
         let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
         let mut inputs = AudioBusBuffers { numChannels: 2, silenceFlags: 0, __field0: AudioBusBuffers__type0 { channelBuffers32: in_ptrs.as_mut_ptr() } };
         let mut outputs = AudioBusBuffers { numChannels: 2, silenceFlags: 0, __field0: AudioBusBuffers__type0 { channelBuffers32: out_ptrs.as_mut_ptr() } };
+        // The host's transport plays at 128 BPM.
+        let mut context: ProcessContext = std::mem::zeroed();
+        context.state = ProcessContext_::StatesAndFlags_::kPlaying | ProcessContext_::StatesAndFlags_::kTempoValid;
+        context.tempo = 128.0;
         let mut data = ProcessData {
             processMode: ProcessModes_::kRealtime as i32,
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
@@ -168,7 +176,7 @@ fn host_round_trip() {
             outputParameterChanges: ptr::null_mut(),
             inputEvents: events.as_ptr(),
             outputEvents: ptr::null_mut(),
-            processContext: ptr::null_mut(),
+            processContext: &mut context,
         };
         assert_eq!(processor.process(&mut data), kResultOk);
         assert_eq!(out_l, in_l, "audio must pass through unchanged");
@@ -184,23 +192,20 @@ fn host_round_trip() {
         drop((processor, controller, component));
 
         let store = modometer::store::Store::new(dir.clone());
-        let mut total = 0;
-        let mut notes = Vec::new();
-        let mut vels = Vec::new();
+        let mut all = modometer::store::MinuteCounts::default();
         for m in store.months("Default") {
-            modometer::store::scan_file(&store.month_path("Default", m), 0, true, |l| {
-                total += l.total;
-                notes.extend_from_slice(&l.notes);
-                vels.extend_from_slice(&l.vels);
-            })
-            .unwrap();
+            store.scan_month("Default", m, true, |l| all.merge(&l.counts));
         }
-        assert_eq!(total, 3);
-        assert_eq!(notes, vec![(36, 1), (38, 1), (42, 1)]);
-        assert_eq!(vels, vec![(32, 1), (64, 1), (127, 1)]);
+        assert_eq!(all.total, 3);
+        let nonzero = |a: &[u32; 128]| a.iter().enumerate().filter(|(_, &n)| n > 0).map(|(i, &n)| (i, n)).collect::<Vec<_>>();
+        assert_eq!(nonzero(&all.notes), vec![(36, 1), (38, 1), (42, 1)]);
+        assert_eq!(nonzero(&all.vels), vec![(32, 1), (64, 1), (127, 1)]);
+        assert_eq!(all.detail.host_tempo.iter().collect::<Vec<_>>(), vec![(&128, &3)]);
 
-        // A second instance restores the profile from the saved state.
+        // A second instance restores the profile from the saved state. This profile reads the
+        // hi-hat pedal.
         store.create_profile("Drums").unwrap();
+        std::fs::write(store.profile_dir("Drums").join("settings.txt"), "hihat-pedal-cc 4\n").unwrap();
         let component = create(&factory);
         component.initialize(ptr::null_mut());
         let s2 = ComWrapper::new(Stream::default());
@@ -211,6 +216,12 @@ fn host_round_trip() {
         let out_ptr = out.to_com_ptr::<IBStream>().unwrap();
         component.getState(out_ptr.as_ptr());
         assert_eq!(out.data.borrow().as_slice(), b"MODOMETER1\nDrums\n");
+        let mapping = component.cast::<IMidiMapping>().unwrap();
+        let mut id = 99;
+        assert_eq!(mapping.getMidiControllerAssignment(0, 9, 4, &mut id), kResultTrue);
+        assert_eq!(id, 1);
+        assert_eq!(mapping.getMidiControllerAssignment(0, 9, 7, &mut id), kResultFalse);
+        drop(mapping);
 
         // The editor's size is kept with the state too.
         let s3 = ComWrapper::new(Stream::default());

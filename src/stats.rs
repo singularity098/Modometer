@@ -267,7 +267,7 @@ fn scan(
     let available = store.months(profile);
     while month <= last {
         if available.binary_search(&month).is_ok() {
-            let _ = store::scan_file(&store.month_path(profile, month), 0, detail, |l| {
+            store.scan_month(profile, month, detail, |l| {
                 if l.minute >= start_m && l.minute < end_m {
                     f(l.minute, l.total, Some(l), None);
                 }
@@ -375,15 +375,7 @@ pub fn compute(store: &Store, profile: &str, q: Query, pending: &BTreeMap<i64, M
             *c += total;
         }
         stats.total += total;
-        if let Some(l) = line {
-            for &(n, c) in &l.notes {
-                stats.notes[n as usize] += c as u64;
-            }
-            for &(v, c) in &l.vels {
-                stats.vels[v as usize] += c as u64;
-            }
-        }
-        if let Some(c) = unsaved {
+        if let Some(c) = line.map(|l| &l.counts).or(unsaved) {
             for (i, &n) in c.notes.iter().enumerate() {
                 stats.notes[i] += n as u64;
             }

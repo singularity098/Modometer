@@ -3,6 +3,7 @@
 
 //! Modometer: a VST3 plugin that counts every MIDI note played, per profile, forever.
 
+pub mod analyze;
 pub mod kit;
 pub mod session;
 pub mod stats;

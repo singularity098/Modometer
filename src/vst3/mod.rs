@@ -6,6 +6,10 @@
 //! One class is both the processor and the controller (a "single component effect"). It has a
 //! stereo audio bus, copied through untouched, and one MIDI input bus. It declares no MIDI output,
 //! so hosts pass the incoming MIDI on to the next plugin unchanged.
+//!
+//! It asks the host for its tempo and transport state, to log the project tempo while it plays.
+//! If the profile reads the hi-hat pedal, it maps that MIDI CC (via `IMidiMapping`) to its one
+//! parameter, "Hi-hat pedal", which only ever reads.
 
 mod view;
 
@@ -18,8 +22,11 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{uid, Class, ComRef, ComWrapper};
 
-use crate::session::{Guard, Shared};
+use crate::session::{Guard, Shared, NO_PEDAL};
 use crate::store::{self, Store};
+
+/// The hi-hat pedal parameter, fed by the host from the pedal's MIDI CC.
+const PEDAL_PARAM: ParamID = 1;
 
 pub const PLUGIN_NAME: &str = "Modometer";
 pub const VENDOR: &str = "Kaia";
@@ -56,6 +63,8 @@ pub struct Modometer {
     guard: RefCell<Guard>,
     clock: Cell<u64>,
     rate: Cell<f64>,
+    /// The pedal parameter's last value (controller side).
+    pedal: Cell<f64>,
 }
 
 // The host calls the controller and processor parts from its own threads as the VST3 threading
@@ -64,7 +73,7 @@ unsafe impl Send for Modometer {}
 unsafe impl Sync for Modometer {}
 
 impl Class for Modometer {
-    type Interfaces = (IComponent, IAudioProcessor, IProcessContextRequirements, IEditController);
+    type Interfaces = (IComponent, IAudioProcessor, IProcessContextRequirements, IEditController, IMidiMapping);
 }
 
 impl Modometer {
@@ -78,6 +87,7 @@ impl Modometer {
             guard: RefCell::new(Guard::default()),
             clock: Cell::new(0),
             rate: Cell::new(48000.0),
+            pedal: Cell::new(0.0),
         }
     }
 
@@ -99,6 +109,7 @@ impl IPluginBaseTrait for Modometer {
     }
 
     unsafe fn terminate(&self) -> tresult {
+        self.shared.on_pedal_cc_change(None);
         self.shared.shutdown();
         kResultOk
     }
@@ -270,7 +281,57 @@ impl IAudioProcessorTrait for Modometer {
 
         // Count note-ons (note-on with velocity 0 is a note-off), through the retrigger guard.
         let clock = self.clock.get();
-        if let (Some(events), Ok(mut guard)) = (ComRef::from_raw(data.inputEvents), self.guard.try_borrow_mut()) {
+        if let Ok(mut guard) = self.guard.try_borrow_mut() {
+            self.count(data, &mut guard, clock);
+        }
+        self.clock.set(clock + data.numSamples.max(0) as u64);
+
+        // Audio through, untouched.
+        self.copy_audio(data);
+        kResultOk
+    }
+
+    unsafe fn getTailSamples(&self) -> u32 {
+        0
+    }
+}
+
+impl Modometer {
+    /// Counts the block's note-ons, with the host's tempo and the hi-hat pedal. Audio thread.
+    unsafe fn count(&self, data: &ProcessData, guard: &mut Guard, clock: u64) {
+
+        // The host's tempo, while its transport plays.
+        guard.host_bpm_x10 = match data.processContext.as_ref() {
+            Some(ctx) => {
+                use ProcessContext_::StatesAndFlags_::{kPlaying, kTempoValid};
+                let ok = ctx.state & kPlaying != 0 && ctx.state & kTempoValid != 0;
+                if ok && ctx.tempo.is_finite() && ctx.tempo > 0.0 { (ctx.tempo * 10.0).round().min(9990.0) as u16 } else { 0 }
+            }
+            None => 0,
+        };
+
+        // Hi-hat pedal changes this block: (sample offset, 0-127), in order. A fixed array, so
+        // nothing is allocated.
+        let mut pedal = [(0i32, 0u8); 32];
+        let mut pedal_n = 0;
+        if let Some(changes) = ComRef::from_raw(data.inputParameterChanges) {
+            for i in 0..changes.getParameterCount() {
+                let Some(q) = ComRef::from_raw(changes.getParameterData(i)) else { continue };
+                if q.getParameterId() != PEDAL_PARAM {
+                    continue;
+                }
+                for k in 0..q.getPointCount() {
+                    let (mut offset, mut value) = (0, 0.0);
+                    if q.getPoint(k, &mut offset, &mut value) == kResultOk && pedal_n < pedal.len() {
+                        pedal[pedal_n] = (offset, (value * 127.0).round().clamp(0.0, 127.0) as u8);
+                        pedal_n += 1;
+                    }
+                }
+            }
+        }
+        let mut next_pedal = 0;
+
+        if let Some(events) = ComRef::from_raw(data.inputEvents) {
             let mut minute = None;
             for i in 0..events.getEventCount() {
                 let mut e: Event = std::mem::zeroed();
@@ -282,14 +343,24 @@ impl IAudioProcessorTrait for Modometer {
                 if vel == 0 || !(0..128).contains(&on.pitch) {
                     continue;
                 }
+                while next_pedal < pedal_n && pedal[next_pedal].0 <= e.sampleOffset {
+                    guard.pedal = pedal[next_pedal].1;
+                    next_pedal += 1;
+                }
                 let m = *minute.get_or_insert_with(|| store::now_minute() as u32);
                 let at = clock + e.sampleOffset.max(0) as u64;
-                self.shared.note_on(&mut guard, at, self.rate.get(), m, on.pitch as u8, vel);
+                self.shared.note_on(guard, at, self.rate.get(), m, on.pitch as u8, vel);
             }
         }
-        self.clock.set(clock + data.numSamples.max(0) as u64);
+        if next_pedal < pedal_n {
+            guard.pedal = pedal[pedal_n - 1].1;
+        }
+        if self.shared.pedal_cc() == 0 {
+            guard.pedal = NO_PEDAL;
+        }
+    }
 
-        // Audio through, untouched.
+    unsafe fn copy_audio(&self, data: &ProcessData) {
         let n = data.numSamples.max(0) as usize;
         if data.numInputs >= 1 && data.numOutputs >= 1 && n > 0 && !data.inputs.is_null() && !data.outputs.is_null() {
             let (inp, out) = (&*data.inputs, &mut *data.outputs);
@@ -309,17 +380,25 @@ impl IAudioProcessorTrait for Modometer {
                 }
             }
         }
-        kResultOk
-    }
-
-    unsafe fn getTailSamples(&self) -> u32 {
-        0
     }
 }
 
 impl IProcessContextRequirementsTrait for Modometer {
     unsafe fn getProcessContextRequirements(&self) -> u32 {
-        0
+        use IProcessContextRequirements_::Flags_::{kNeedTempo, kNeedTransportState};
+        kNeedTempo | kNeedTransportState
+    }
+}
+
+impl IMidiMappingTrait for Modometer {
+    unsafe fn getMidiControllerAssignment(&self, bus: i32, _channel: i16, cc: CtrlNumber, id: *mut ParamID) -> tresult {
+        let pedal_cc = self.shared.pedal_cc();
+        if bus == 0 && pedal_cc != 0 && cc == pedal_cc as CtrlNumber && !id.is_null() {
+            *id = PEDAL_PARAM;
+            kResultTrue
+        } else {
+            kResultFalse
+        }
     }
 }
 
@@ -337,15 +416,32 @@ impl IEditControllerTrait for Modometer {
     }
 
     unsafe fn getParameterCount(&self) -> i32 {
-        0
+        1
     }
 
-    unsafe fn getParameterInfo(&self, _index: i32, _info: *mut ParameterInfo) -> tresult {
-        kInvalidArgument
+    unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
+        let Some(info) = info.as_mut() else { return kInvalidArgument };
+        if index != 0 {
+            return kInvalidArgument;
+        }
+        info.id = PEDAL_PARAM;
+        copy_wstring("Hi-hat pedal", &mut info.title);
+        copy_wstring("HH pedal", &mut info.shortTitle);
+        copy_wstring("", &mut info.units);
+        info.stepCount = 127;
+        info.defaultNormalizedValue = 0.0;
+        info.unitId = 0;
+        // Read only as far as the plugin is concerned: it never changes the sound.
+        info.flags = 0;
+        kResultOk
     }
 
-    unsafe fn getParamStringByValue(&self, _id: u32, _value: f64, _string: *mut String128) -> tresult {
-        kInvalidArgument
+    unsafe fn getParamStringByValue(&self, id: u32, value: f64, string: *mut String128) -> tresult {
+        if id != PEDAL_PARAM || string.is_null() {
+            return kInvalidArgument;
+        }
+        copy_wstring(&format!("{}", (value * 127.0).round() as i32), &mut *string);
+        kResultOk
     }
 
     unsafe fn getParamValueByString(&self, _id: u32, _string: *mut TChar, _value: *mut f64) -> tresult {
@@ -360,15 +456,27 @@ impl IEditControllerTrait for Modometer {
         value
     }
 
-    unsafe fn getParamNormalized(&self, _id: u32) -> f64 {
-        0.0
+    unsafe fn getParamNormalized(&self, id: u32) -> f64 {
+        if id == PEDAL_PARAM { self.pedal.get() } else { 0.0 }
     }
 
-    unsafe fn setParamNormalized(&self, _id: u32, _value: f64) -> tresult {
-        kInvalidArgument
+    unsafe fn setParamNormalized(&self, id: u32, value: f64) -> tresult {
+        if id != PEDAL_PARAM {
+            return kInvalidArgument;
+        }
+        self.pedal.set(value.clamp(0.0, 1.0));
+        kResultOk
     }
 
-    unsafe fn setComponentHandler(&self, _handler: *mut IComponentHandler) -> tresult {
+    unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        // When the profile starts or stops reading the pedal, ask the host to read the MIDI
+        // mapping again.
+        let handler = ComRef::from_raw(handler).map(|h| h.to_com_ptr());
+        self.shared.on_pedal_cc_change(handler.map(|h| {
+            Box::new(move || {
+                h.restartComponent(RestartFlags_::kMidiCCAssignmentChanged);
+            }) as Box<dyn Fn() + Send>
+        }));
         kResultOk
     }
 

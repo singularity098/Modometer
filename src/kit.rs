@@ -13,6 +13,12 @@
 //! ```
 //!
 //! Notes that share a name are one drum: their hits are guarded together and add up in the stats.
+//!
+//! `hihat-pedal-cc 4` (off unless present) reads the hi-hat pedal's position from that MIDI CC, to
+//! show how open the hi-hat was when you hit it.
+//!
+//! A profile with at least one named drum is a drum kit: its hits get the drum analysis (rolls,
+//! fills, per-drum dynamics). Others get the keys analysis (chords, intervals).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -32,16 +38,65 @@ pub const PRESETS: [&str; 16] = [
     "Tom 3", "Floor tom", "Crash 1", "Crash 2", "Ride", "Ride bell", "Splash",
 ];
 
+/// The usual hi-hat pedal controller (MIDI CC 4, "foot controller").
+pub const PEDAL_CC: u8 = 4;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Kit {
     /// Hits of the same drum closer together than this count once (0 = off).
     pub retrigger_ms: u32,
     pub names: BTreeMap<u8, String>,
+    /// The MIDI CC of the hi-hat pedal, or 0 to not read it.
+    pub pedal_cc: u8,
 }
 
 impl Default for Kit {
     fn default() -> Self {
-        Kit { retrigger_ms: DEFAULT_RETRIGGER_MS, names: BTreeMap::new() }
+        Kit { retrigger_ms: DEFAULT_RETRIGGER_MS, names: BTreeMap::new(), pedal_cc: 0 }
+    }
+}
+
+/// What part of the kit a drum is, from its name (or its General MIDI note if it has none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Kick,
+    Snare,
+    Tom,
+    HiHat,
+    HatPedal,
+    Cymbal,
+    Other,
+}
+
+impl Role {
+    pub fn of_name(name: &str) -> Role {
+        let n = name.to_lowercase();
+        let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
+        if has(&["hat", "hh"]) {
+            if has(&["pedal", "foot", "chick"]) { Role::HatPedal } else { Role::HiHat }
+        } else if has(&["kick", "bass drum", "bd"]) {
+            Role::Kick
+        } else if has(&["snare", "rim", "stick", "sd"]) {
+            Role::Snare
+        } else if has(&["tom"]) {
+            Role::Tom
+        } else if has(&["crash", "ride", "china", "splash", "cymbal", "bell", "stack"]) {
+            Role::Cymbal
+        } else {
+            Role::Other
+        }
+    }
+
+    pub fn of_gm(note: u8) -> Role {
+        match note {
+            35 | 36 => Role::Kick,
+            37 | 38 | 40 => Role::Snare,
+            41 | 43 | 45 | 47 | 48 | 50 => Role::Tom,
+            42 | 46 => Role::HiHat,
+            44 => Role::HatPedal,
+            49 | 51 | 52 | 53 | 55 | 57 | 59 => Role::Cymbal,
+            _ => Role::Other,
+        }
     }
 }
 
@@ -63,6 +118,10 @@ impl Kit {
                 if let Ok(ms) = ms.trim().parse::<u32>() {
                     kit.retrigger_ms = ms.min(1000);
                 }
+            } else if let Some(cc) = line.strip_prefix("hihat-pedal-cc ") {
+                if let Ok(cc) = cc.trim().parse::<u8>() {
+                    kit.pedal_cc = cc.min(127);
+                }
             } else if let Some(rest) = line.strip_prefix("note ") {
                 let (note, name) = rest.trim().split_once(' ').unwrap_or((rest, ""));
                 if let (Ok(note), Ok(name)) = (note.parse::<u8>(), clean_drum_name(name)) {
@@ -80,6 +139,9 @@ impl Kit {
             "# Modometer settings for this profile. The plugin rewrites this file when you change them.\n",
         );
         let _ = writeln!(s, "retrigger-ms {}", self.retrigger_ms);
+        if self.pedal_cc > 0 {
+            let _ = writeln!(s, "hihat-pedal-cc {}", self.pedal_cc);
+        }
         for (note, name) in &self.names {
             let _ = writeln!(s, "note {note} {name}");
         }
@@ -101,6 +163,28 @@ impl Kit {
 
     pub fn name(&self, note: u8) -> Option<&str> {
         self.names.get(&note).map(String::as_str)
+    }
+
+    /// A drum kit (some drums are named), as opposed to keys.
+    pub fn is_drums(&self) -> bool {
+        !self.names.is_empty()
+    }
+
+    /// Each note's role: from its name, else from General MIDI.
+    pub fn roles(&self) -> [Role; 128] {
+        std::array::from_fn(|n| match self.names.get(&(n as u8)) {
+            Some(name) => Role::of_name(name),
+            None => Role::of_gm(n as u8),
+        })
+    }
+
+    /// The name of the drum `note` leads (the lowest note of a named drum), else the GM name, else
+    /// the note's name.
+    pub fn drum_label(&self, note: u8) -> String {
+        match self.names.get(&note) {
+            Some(n) => n.clone(),
+            None => crate::stats::gm_drum_name(note).map(str::to_string).unwrap_or_else(|| crate::stats::note_name(note)),
+        }
     }
 
     /// For each note, the drum it belongs to: the lowest note with the same name (names compared
@@ -149,6 +233,8 @@ mod tests {
         kit.names.insert(38, "Snare".into());
         kit.names.insert(49, "Crash 2".into());
         assert_eq!(Kit::parse(&kit.format()), kit);
+        kit.pedal_cc = PEDAL_CC;
+        assert_eq!(Kit::parse(&kit.format()), kit);
     }
 
     #[test]
@@ -178,5 +264,23 @@ mod tests {
             kit.drum_counts(&notes),
             vec![("Kick".to_string(), 5), ("Snare".to_string(), 5), ("Other".to_string(), 7)]
         );
+    }
+
+    #[test]
+    fn roles() {
+        assert_eq!(Role::of_name("Hi-hat pedal"), Role::HatPedal);
+        assert_eq!(Role::of_name("Hi-hat edge"), Role::HiHat);
+        assert_eq!(Role::of_name("Kick"), Role::Kick);
+        assert_eq!(Role::of_name("Cross stick"), Role::Snare);
+        assert_eq!(Role::of_name("Floor tom"), Role::Tom);
+        assert_eq!(Role::of_name("Ride bell"), Role::Cymbal);
+        assert_eq!(Role::of_name("Cowbell"), Role::Cymbal);
+        assert_eq!(Role::of_name("Clap"), Role::Other);
+        let kit = Kit::parse("note 50 Crash 1\n");
+        let r = kit.roles();
+        assert_eq!(r[50], Role::Cymbal);
+        assert_eq!(r[36], Role::Kick);
+        assert!(kit.is_drums());
+        assert!(!Kit::default().is_drums());
     }
 }
