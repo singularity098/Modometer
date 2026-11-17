@@ -48,14 +48,22 @@ impl View {
         self.size_at(self.shared.zoom())
     }
 
-    /// The zoom a host-proposed size asks for: whichever side changed more (so dragging one edge
-    /// works), within limits.
+    /// The zoom a host-proposed size asks for, within limits. When only one side changed (the user
+    /// drags one edge of the window), that side decides. When both did (a corner, or a host fitting
+    /// the editor into a space, as Carlita does), the largest size inside the proposed one: a larger
+    /// answer is cut off, and a host that then fits the editor again flips between the two sizes.
     fn zoom_for(&self, w: i32, h: i32) -> f32 {
         let s = self.scale.get();
-        let current = self.shared.zoom();
+        let (cw, ch) = self.size();
         let zw = w as f32 / (theme::WIDTH as f32 * s);
         let zh = h as f32 / (theme::HEIGHT as f32 * s);
-        let z = if (zw - current).abs() >= (zh - current).abs() { zw } else { zh };
+        let z = if h == ch {
+            zw
+        } else if w == cw {
+            zh
+        } else {
+            zw.min(zh)
+        };
         z.clamp(MIN_ZOOM, MAX_ZOOM)
     }
 }

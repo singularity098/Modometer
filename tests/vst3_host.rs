@@ -242,6 +242,17 @@ fn host_round_trip() {
         let mut r = ViewRect { left: 0, top: 0, right: 1600, bottom: 675 };
         assert_eq!(view.checkSizeConstraint(&mut r), kResultTrue);
         assert_eq!((r.right, r.bottom), (1600, 900));
+        let mut r = ViewRect { left: 0, top: 0, right: 1200, bottom: 900 };
+        view.checkSizeConstraint(&mut r);
+        assert_eq!((r.right, r.bottom), (1600, 900));
+        // A host fitting the editor into a space (both sides change) gets the largest size inside
+        // it, not one that is cut off.
+        let mut r = ViewRect { left: 0, top: 0, right: 760, bottom: 500 };
+        view.checkSizeConstraint(&mut r);
+        assert_eq!((r.right, r.bottom), (760, 428));
+        let mut r = ViewRect { left: 0, top: 0, right: 2000, bottom: 700 };
+        view.checkSizeConstraint(&mut r);
+        assert_eq!((r.right, r.bottom), (1244, 700));
         let mut r = ViewRect { left: 0, top: 0, right: 100, bottom: 100 };
         view.checkSizeConstraint(&mut r);
         assert_eq!((r.right, r.bottom), (600, 338));

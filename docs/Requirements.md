@@ -206,7 +206,10 @@ Times are stored in UTC and shown in local time, so DST changes and travel stay 
 ### UI
 - baseview + femtovg (OpenGL). Laid out at 800 × 450 and scaled to the window: the view is
   resizable (owner, 2026-11-05). `checkSizeConstraint` keeps the 16:9 shape between 0.75× and 3×
-  (times the host's content scale), following whichever side the user dragged; `onSize` resizes the
+  (times the host's content scale), following the side the user dragged, or, when both sides change
+  (a corner, or a host such as Carlita fitting the editor into its space), the largest 16:9 size
+  inside the proposed one (2026-11-17: a larger answer was cut off, and Carlita flipped between the
+  two sizes); `onSize` resizes the
   window to whatever the host gives, and the layout is centred with even margins if the shape
   differs. The zoom is saved in the instance's state (`zoom 1.500` after the profile name; older
   versions ignore it).
