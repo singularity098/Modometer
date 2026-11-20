@@ -220,6 +220,12 @@ Times are stored in UTC and shown in local time, so DST changes and travel stay 
   the thing under the mouse changes. Measured idle cost with the window open: about 0.35% of a core.
 - Font: Jost (variable; 200 for the counter, 300 elsewhere), from Xythos, SIL OFL.
 - Gradient: Xythos's Iris preset, #c688d6 → #a85eea → #7278fe.
+- Icon and banner (owner, 2026-11-20): the icon is "Velocity dots", an M in a 5 × 5 dot grid on a
+  rounded near-black tile, each lit dot in the Iris gradient and sized like a hit's velocity (largest
+  at the top). The banner uses that M as the first letter, larger than the rest, then "odometer" in
+  Jost 300 with no tagline, over a hit lane (a row of dots sized by velocity). Files in
+  `resources/branding/`, made by `scripts/branding.py` (text as outlines, so the SVGs need no font)
+  and `scripts/branding_png.js` (PNGs).
 - Counter view: profile picker (top left; switch or create profiles), Drums and Stats (top right),
   the count, today's count and the streak (days in a row). Under it, a celebration when today
   passed a milestone, or is the best day yet, or has the busiest minute yet (best day and minute

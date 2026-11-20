@@ -1,4 +1,4 @@
-# Modometer
+![Modometer](resources/branding/banner.svg)
 
 A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
 

@@ -46,6 +46,9 @@ examples/preview.rs     The window on its own with fake data; --stats, --kit, --
 examples/embed_test.rs  Embeds the editor via IPlugView into a parent window, like a host; --resize
 tests/vst3_host.rs      Drives the plugin through its VST3 interfaces
 scripts/bundle.sh       Builds "Modometer.vst3" (--install copies to ~/.vst3)
+scripts/branding.py     Writes the icon and banner SVGs to resources/branding/ (needs fonttools, uharfbuzz);
+                        scripts/branding_png.js renders them to PNG
+resources/branding/     Icon (Velocity dots M) and README banner, SVG and PNG
 resources/fonts/        Jost (OFL)
 ```
 
