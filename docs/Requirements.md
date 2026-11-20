@@ -226,7 +226,8 @@ Times are stored in UTC and shown in local time, so DST changes and travel stay 
   Jost 300 with no tagline, over a hit lane (a row of dots sized by velocity). Files in
   `resources/branding/`, made by `scripts/branding.py` (text as outlines, so the SVGs need no font)
   and `scripts/branding_png.js` (PNGs).
-- Counter view: profile picker (top left; switch or create profiles), Drums and Stats (top right),
+- Counter view: the Modometer logo (top left, small: dot M, "odometer", a short centred hit lane
+  under it), then the profile picker (switch or create profiles), Drums and Stats (top right),
   the count, today's count and the streak (days in a row). Under it, a celebration when today
   passed a milestone, or is the best day yet, or has the busiest minute yet (best day and minute
   only after 7 days played); a short sparkle when one happens with the window open. The records are
