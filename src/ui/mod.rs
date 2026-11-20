@@ -217,6 +217,8 @@ struct Ui {
     kit_scroll: usize,
     seen_recent: u32,
     screenshot_done: bool,
+    /// Where the profile picker was drawn, so its list opens under it.
+    profile_x: f32,
 }
 
 pub struct Editor {
@@ -302,6 +304,7 @@ impl Editor {
             kit_scroll: 0,
             seen_recent: shared.recent_seq(),
             screenshot_done: false,
+            profile_x: 16.0,
         };
         let editor = Editor {
             ctx,
@@ -613,16 +616,21 @@ impl Editor {
 
     fn draw_counter(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
         let w = WIDTH as f32;
-        // Profile picker, top left.
+        // The logo, top left.
+        let logo_w = self.draw_logo(c, 26.0, 38.0, 26.0);
+
+        // Profile picker, right of the logo.
         let name = ui.snapshot.profile.clone();
         let name_w = self.measure(c, &name, 15.0, 300.0);
-        let r = Rect::new(16.0, 14.0, name_w + 40.0, 32.0);
+        let r = Rect::new(26.0 + logo_w + 28.0, 14.0, name_w + 40.0, 32.0);
+        ui.profile_x = r.x;
         let hovered = r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
         if hovered || matches!(ui.overlay, Overlay::Profiles { .. }) {
             Self::rounded(c, r, 4.0, Some(theme::hover_fill()), None);
         }
-        self.text(c, 28.0, r.y + r.h / 2.0, &name, 15.0, theme::text(), Align::Left);
-        Self::chevron(c, 28.0 + name_w + 14.0, r.y + r.h / 2.0, 3.5, 0, theme::dim());
+        Self::vline(c, r.x - 12.0, 20.0, 40.0, theme::hairline());
+        self.text(c, r.x + 12.0, r.y + r.h / 2.0, &name, 15.0, theme::text(), Align::Left);
+        Self::chevron(c, r.x + 12.0 + name_w + 14.0, r.y + r.h / 2.0, 3.5, 0, theme::dim());
         ui.regions.push((r, Action::OpenProfiles));
 
         // Stats, top right.
@@ -701,6 +709,54 @@ impl Editor {
         }
     }
 
+    /// The Modometer logo (as in resources/branding: a dot M, "odometer", and a short lane of hits
+    /// under it), drawn with its left edge at `x` and the word's baseline at `baseline`. Returns its width.
+    fn draw_logo(&self, c: &mut Canvas<OpenGl>, x: f32, baseline: f32, size: f32) -> f32 {
+        // The M: a 5 x 5 grid of dots on a 14-unit pitch, lower dots a little smaller, like
+        // softer hits. It stands 1.45 x Jost's cap height (0.7 em) and sits on the baseline.
+        const LIT: [(u8, u8); 13] =
+            [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (4, 0), (4, 1), (4, 2), (4, 3), (4, 4), (1, 1), (2, 2), (3, 1)];
+        let k = size * 0.7 * 1.45 / 67.4;
+        let top = baseline - 67.4 * k;
+        let m_w = 67.2 * k;
+        let paint = theme::gradient(x, top, x + m_w, baseline, 255);
+        let mut p = Path::new();
+        for (col, row) in LIT {
+            let r = (5.6 - row as f32 * 0.45) * k;
+            p.circle(x + (5.6 + col as f32 * 14.0) * k, top + (5.6 + row as f32 * 14.0) * k, r);
+        }
+        c.fill_path(&p, &paint);
+
+        let tx = x + m_w + size * 0.06;
+        let paint = Paint::color(theme::text())
+            .with_font(&[self.font])
+            .with_font_size(size)
+            .with_font_weight(300.0)
+            .with_text_align(Align::Left)
+            .with_text_baseline(Baseline::Alphabetic);
+        let word_w = c.fill_text(tx, baseline, "odometer", &paint).map(|m| m.width()).unwrap_or(0.0);
+        let logo_w = tx + word_w - x;
+
+        // The hit lane: shorter than the logo and centred under it.
+        const VEL: [f32; 12] = [1.0, 0.3, 0.55, 0.3, 0.85, 0.3, 0.55, 0.65, 1.0, 0.4, 0.9, 0.6];
+        let lane_w = logo_w * 0.6;
+        let (lx, ly) = (x + (logo_w - lane_w) / 2.0, baseline + size * 0.5);
+        Self::hline(c, lx - 2.0, lx + lane_w + 2.0, ly, theme::hairline());
+        let mut p = Path::new();
+        let step = lane_w / (VEL.len() - 1) as f32;
+        for (i, v) in VEL.iter().enumerate() {
+            p.circle(lx + i as f32 * step, ly, size * (0.03 + v * 0.07));
+        }
+        c.fill_path(&p, &theme::gradient(lx, ly, lx + lane_w, ly, 255));
+        logo_w
+    }
+
+    fn vline(c: &mut Canvas<OpenGl>, x: f32, y0: f32, y1: f32, color: Color) {
+        let mut p = Path::new();
+        p.rect(x, y0, 1.0, y1 - y0);
+        c.fill_path(&p, &Paint::color(color));
+    }
+
     /// A burst of sparks from (x, y), `k` from 0 (start) to 1 (gone).
     fn sparkle(c: &mut Canvas<OpenGl>, x: f32, y: f32, k: f32) {
         let ease = 1.0 - (1.0 - k).powi(3);
@@ -725,7 +781,7 @@ impl Editor {
         let n = ui.profiles.len();
         *scroll = (*scroll).min(n.saturating_sub(max_items));
         let shown = n.min(max_items);
-        let panel = Rect::new(16.0, 50.0, 280.0, shown as f32 * item_h + item_h + 13.0);
+        let panel = Rect::new(ui.profile_x, 50.0, 280.0, shown as f32 * item_h + item_h + 13.0);
         Self::rounded(c, panel, 6.0, Some(theme::popup_fill()), Some(Paint::color(theme::hairline())));
         ui.regions.push((panel, Action::None));
         let mut y = panel.y + 4.0;
