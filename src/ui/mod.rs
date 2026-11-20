@@ -617,7 +617,7 @@ impl Editor {
     fn draw_counter(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
         let w = WIDTH as f32;
         // The logo, top left.
-        let logo_w = self.draw_logo(c, 26.0, 34.0, 23.0);
+        let logo_w = self.draw_logo(c, 26.0, 38.0, 26.0);
 
         // Profile picker, right of the logo.
         let name = ui.snapshot.profile.clone();
