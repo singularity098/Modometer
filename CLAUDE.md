@@ -10,7 +10,15 @@ forever, with stats. Vendor "Kaia". MIT.
 
 - **Requirements and decisions**: `docs/Requirements.md` is the source of truth; record new decisions
   there.
-- **Branch**: work on `main` and push to `main` (owner, 2026-11-05). Don't create other branches.
+
+## Git workflow
+
+- **Commit and push directly to `main`.** Don't create feature branches or open pull requests
+  unless the owner asks for one.
+- Claude Code setups (the web version especially) may create their own working branch for the
+  session. Even then, don't use that branch: commit on `main` and push `main`
+  (`git push origin HEAD:main`). Don't push the session branch.
+- This is a solo project: branches and PRs add very little here and create unwanted overhead.
 
 ## Fixed decisions (don't revisit without the owner)
 
