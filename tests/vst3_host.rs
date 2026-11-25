@@ -238,26 +238,99 @@ fn host_round_trip() {
         let mut rect: ViewRect = std::mem::zeroed();
         assert_eq!(view.getSize(&mut rect), kResultOk);
         assert_eq!((rect.right, rect.bottom), (1200, 675));
-        // Dragging the width keeps the shape; sizes stay within limits.
-        let mut r = ViewRect { left: 0, top: 0, right: 1600, bottom: 675 };
-        assert_eq!(view.checkSizeConstraint(&mut r), kResultTrue);
-        assert_eq!((r.right, r.bottom), (1600, 900));
-        let mut r = ViewRect { left: 0, top: 0, right: 1200, bottom: 900 };
-        view.checkSizeConstraint(&mut r);
-        assert_eq!((r.right, r.bottom), (1600, 900));
-        // A host fitting the editor into a space (both sides change) gets the largest size inside
-        // it, not one that is cut off.
-        let mut r = ViewRect { left: 0, top: 0, right: 760, bottom: 500 };
-        view.checkSizeConstraint(&mut r);
-        assert_eq!((r.right, r.bottom), (760, 428));
-        let mut r = ViewRect { left: 0, top: 0, right: 2000, bottom: 700 };
-        view.checkSizeConstraint(&mut r);
-        assert_eq!((r.right, r.bottom), (1244, 700));
-        let mut r = ViewRect { left: 0, top: 0, right: 100, bottom: 100 };
-        view.checkSizeConstraint(&mut r);
-        assert_eq!((r.right, r.bottom), (600, 338));
+        // Any shape goes, each side within limits (0.75x to 3x of 800 x 450).
+        for ((w, h), want) in [
+            ((1600, 675), (1600, 675)),
+            ((1200, 900), (1200, 900)),
+            ((760, 500), (760, 500)),
+            ((2000, 700), (2000, 700)),
+            ((100, 100), (600, 338)),
+            ((3000, 2000), (2400, 1350)),
+        ] {
+            let mut r = ViewRect { left: 0, top: 0, right: w, bottom: h };
+            assert_eq!(view.checkSizeConstraint(&mut r), kResultTrue);
+            assert_eq!((r.right, r.bottom), want);
+        }
+        // The host settles on a size of another shape: it's kept with the state, after a zoom for
+        // older versions.
+        let mut r = ViewRect { left: 0, top: 0, right: 1000, bottom: 600 };
+        assert_eq!(view.onSize(&mut r), kResultOk);
+        let mut rect: ViewRect = std::mem::zeroed();
+        view.getSize(&mut rect);
+        assert_eq!((rect.right, rect.bottom), (1000, 600));
+        let out = ComWrapper::new(Stream::default());
+        let out_ptr = out.to_com_ptr::<IBStream>().unwrap();
+        component.getState(out_ptr.as_ptr());
+        assert_eq!(out.data.borrow().as_slice(), b"MODOMETER1\nDrums\nzoom 1.250\nsize 1000 600\n");
+        let s4 = ComWrapper::new(Stream::default());
+        *s4.data.borrow_mut() = b"MODOMETER1\nDrums\nzoom 1.000\nsize 900 700\n".to_vec();
+        let s4 = s4.to_com_ptr::<IBStream>().unwrap();
+        assert_eq!(component.setState(s4.as_ptr()), kResultOk);
+        view.getSize(&mut rect);
+        assert_eq!((rect.right, rect.bottom), (900, 700));
         drop((view, controller));
         component.terminate();
+
+        // An audio profile logs the seconds a signal comes in (and ignores MIDI). At 1 kHz, 3 s
+        // of signal then 6 s of silence: 3 s played plus the 4 s it takes to call it a pause.
+        store.create_profile("Bass").unwrap();
+        std::fs::write(store.profile_dir("Bass").join("settings.txt"), "type audio\n").unwrap();
+        let component = create(&factory);
+        component.initialize(ptr::null_mut());
+        let s5 = ComWrapper::new(Stream::default());
+        *s5.data.borrow_mut() = b"MODOMETER1\nBass\n".to_vec();
+        let s5 = s5.to_com_ptr::<IBStream>().unwrap();
+        assert_eq!(component.setState(s5.as_ptr()), kResultOk);
+        let processor = component.cast::<IAudioProcessor>().unwrap();
+        let mut setup = ProcessSetup {
+            processMode: ProcessModes_::kRealtime as i32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+            maxSamplesPerBlock: 100,
+            sampleRate: 1000.0,
+        };
+        assert_eq!(processor.setupProcessing(&mut setup), kResultOk);
+        component.setActive(1);
+        processor.setProcessing(1);
+        let events = ComWrapper::new(Events(vec![note_on(60, 0.8)])).to_com_ptr::<IEventList>().unwrap();
+        for block in 0..90 {
+            let level = if block < 30 { 0.25 } else { 0.0 };
+            let mut in_l = vec![level; 100];
+            let mut in_r = vec![-level; 100];
+            let (mut out_l, mut out_r) = (vec![0.0f32; 100], vec![0.0f32; 100]);
+            let mut in_ptrs = [in_l.as_mut_ptr(), in_r.as_mut_ptr()];
+            let mut out_ptrs = [out_l.as_mut_ptr(), out_r.as_mut_ptr()];
+            let mut inputs = AudioBusBuffers { numChannels: 2, silenceFlags: 0, __field0: AudioBusBuffers__type0 { channelBuffers32: in_ptrs.as_mut_ptr() } };
+            let mut outputs = AudioBusBuffers { numChannels: 2, silenceFlags: 0, __field0: AudioBusBuffers__type0 { channelBuffers32: out_ptrs.as_mut_ptr() } };
+            let mut data = ProcessData {
+                processMode: ProcessModes_::kRealtime as i32,
+                symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+                numSamples: 100,
+                numInputs: 1,
+                numOutputs: 1,
+                inputs: &mut inputs,
+                outputs: &mut outputs,
+                inputParameterChanges: ptr::null_mut(),
+                outputParameterChanges: ptr::null_mut(),
+                inputEvents: if block == 0 { events.as_ptr() } else { ptr::null_mut() },
+                outputEvents: ptr::null_mut(),
+                processContext: ptr::null_mut(),
+            };
+            assert_eq!(processor.process(&mut data), kResultOk);
+            assert_eq!(out_l, in_l, "audio must pass through unchanged");
+        }
+        processor.setProcessing(0);
+        component.setActive(0);
+        component.terminate();
+        drop((processor, component));
+        let mut total = 0;
+        let mut notes = 0;
+        for m in store.months("Bass") {
+            store.scan_month("Bass", m, true, |l| {
+                total += l.total;
+                notes += l.counts.notes.iter().sum::<u32>();
+            });
+        }
+        assert_eq!((total, notes), (7, 0));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

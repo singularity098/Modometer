@@ -10,7 +10,7 @@ mod kit;
 mod pages;
 pub mod theme;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use femtovg::renderer::OpenGl;
 use femtovg::{Align, Baseline, Canvas, Color, FontId, Paint, Path};
 use keyboard_types::{Key, KeyState, NamedKey};
 
-use crate::kit::{Kit, RETRIGGER_CHOICES};
+use crate::kit::{Kind, Kit, RETRIGGER_CHOICES};
 use crate::session::{Cheer, Shared, Snapshot};
 use crate::stats::{self, Bucket, History, Query, Span, Stats};
 use theme::{commas, WithAlpha, HEIGHT, WIDTH};
@@ -45,9 +45,7 @@ pub struct Options {
 
 /// Window settings to try, best first: multisampled, then plain (some drivers and virtual displays
 /// have no multisampled configs).
-pub fn window_settings(scale: f64) -> Vec<WindowSettings> {
-    let w = (WIDTH as f64 * scale).round() as u32;
-    let h = (HEIGHT as f64 * scale).round() as u32;
+pub fn window_settings(w: u32, h: u32) -> Vec<WindowSettings> {
     let base = WindowSettings::new()
         .with_title("Modometer")
         .with_size(baseview::dpi::PhysicalSize::new(w, h))
@@ -85,6 +83,8 @@ enum Action {
     SelectProfile(String),
     NewProfile,
     CreateProfile,
+    /// The new profile's kind: audio (true) or MIDI.
+    NewProfileAudio(bool),
     Field,
     ShowStats,
     ShowCounter,
@@ -176,7 +176,7 @@ const CHEER_ANIMATION: Duration = Duration::from_millis(2600);
 enum Overlay {
     None,
     Profiles { scroll: usize },
-    NewProfile { text: String, error: Option<String> },
+    NewProfile { text: String, error: Option<String>, audio: bool },
     /// Waiting for a hit; `since` is the monitor's sequence number when Learn was pressed.
     Learn { since: u32 },
     /// Naming `note`. `edited` once the user typed or picked a name.
@@ -196,7 +196,8 @@ struct Ui {
     snapshot: Snapshot,
     seen_hits: u64,
     seen_generation: u64,
-    profiles: Vec<String>,
+    /// Profiles and whether each is an audio profile.
+    profiles: Vec<(String, bool)>,
     query: Query,
     stats: Option<Stats>,
     history: Option<Arc<History>>,
@@ -230,6 +231,8 @@ pub struct Editor {
     ui: RefCell<Ui>,
     timer: RefCell<Option<TimerHandle>>,
     options: Options,
+    /// The layout's size in layout units: at least 800 × 450, and the window's shape.
+    dims: Cell<(f32, f32)>,
 }
 
 fn handler_error(msg: impl Into<String>) -> HandlerError {
@@ -278,7 +281,7 @@ impl Editor {
             snapshot,
             seen_hits: shared.hits_seen(),
             seen_generation: shared.generation.load(std::sync::atomic::Ordering::Relaxed),
-            profiles: shared.store().list_profiles(),
+            profiles: list_profiles(&shared),
             query: Query { span, offset: 0, bucket: span.default_bucket() },
             stats: None,
             history: None,
@@ -315,6 +318,7 @@ impl Editor {
             ui: RefCell::new(ui),
             timer: RefCell::new(timer),
             options,
+            dims: Cell::new((WIDTH as f32, HEIGHT as f32)),
         };
         if editor.ui.borrow().view == View::Stats {
             editor.load_stats(&mut editor.ui.borrow_mut());
@@ -322,11 +326,34 @@ impl Editor {
         Ok(editor)
     }
 
-    /// How the 800 × 450 layout maps onto the window: (scale, x offset, y offset). The layout keeps
-    /// its shape at any window size; a window of another shape gets even margins.
+    /// How the layout maps onto the window: (scale, layout width, layout height). The layout is
+    /// designed at 800 × 450 and scaled so that fits; the other side stretches to the window's shape.
     fn layout(&self) -> (f32, f32, f32) {
         let size = self.ctx.size();
         fit(size.physical.width as f32, size.physical.height as f32)
+    }
+
+    /// The layout's width and height (see [`Self::layout`]).
+    pub(super) fn w(&self) -> f32 {
+        self.dims.get().0
+    }
+
+    pub(super) fn h(&self) -> f32 {
+        self.dims.get().1
+    }
+
+    /// How much wider and taller the layout is than 800 × 450.
+    pub(super) fn extra(&self) -> (f32, f32) {
+        let (w, h) = self.dims.get();
+        ((w - WIDTH as f32).max(0.0), (h - HEIGHT as f32).max(0.0))
+    }
+
+    /// Two columns that share the extra width: (left width, right x, right width), from the
+    /// 800-wide layout's left width and right x.
+    pub(super) fn columns(&self, left_w: f32, right_x: f32) -> (f32, f32, f32) {
+        let half = self.extra().0 / 2.0;
+        let rx = right_x + half;
+        (left_w + half, rx, self.w() - 16.0 - rx)
     }
 
     /// Hand over things you can click, an I-beam over text fields, the arrow elsewhere.
@@ -350,12 +377,15 @@ impl Editor {
         let query = ui.query;
         let pace_cache = Arc::clone(&ui.pace);
         let history_cache = Arc::clone(&ui.history_cache);
+        let audio = ui.kit.is_audio();
         std::thread::spawn(move || {
             let pending = shared.pending();
             let profile = shared.profile_name();
             let now = crate::store::now_minute();
             let cached = pace_cache.lock().unwrap().clone();
             let pace = match cached {
+                // An audio profile logs seconds, so 60 make a full minute.
+                _ if audio => Some(60.0),
                 Some((p, at, pace)) if p == profile && now - at < PACE_MAX_AGE => pace,
                 _ => {
                     let pace = stats::pace(shared.store(), &profile, &pending);
@@ -387,23 +417,29 @@ impl Editor {
     fn act(&self, ui: &mut Ui, action: Action) {
         match action {
             Action::OpenProfiles => {
-                ui.profiles = self.shared.store().list_profiles();
+                ui.profiles = list_profiles(&self.shared);
                 ui.overlay = Overlay::Profiles { scroll: 0 };
             }
             Action::CloseOverlay => ui.overlay = Overlay::None,
             Action::SelectProfile(name) => {
                 self.shared.select_profile(&name);
-                ui.note_mode = NoteMode::default_for(&self.shared.kit());
+                ui.kit = self.shared.kit();
+                ui.note_mode = NoteMode::default_for(&ui.kit);
                 ui.overlay = Overlay::None;
                 if ui.view == View::Stats {
                     self.load_stats(ui);
                 }
             }
             Action::NewProfile => {
-                ui.overlay = Overlay::NewProfile { text: String::new(), error: None };
+                ui.overlay = Overlay::NewProfile { text: String::new(), error: None, audio: false };
                 let _ = self.ctx.focus();
             }
             Action::CreateProfile => self.create_profile(ui),
+            Action::NewProfileAudio(a) => {
+                if let Overlay::NewProfile { audio, .. } = &mut ui.overlay {
+                    *audio = a;
+                }
+            }
             Action::Field => {
                 let _ = self.ctx.focus();
             }
@@ -485,11 +521,14 @@ impl Editor {
     }
 
     fn create_profile(&self, ui: &mut Ui) {
-        if let Overlay::NewProfile { text, error } = &mut ui.overlay {
-            match self.shared.create_profile(text) {
+        if let Overlay::NewProfile { text, error, audio } = &mut ui.overlay {
+            let kind = if *audio { Kind::Audio } else { Kind::Midi };
+            match self.shared.create_profile_of(text, kind) {
                 Ok(_) => {
                     ui.overlay = Overlay::None;
-                    ui.profiles = self.shared.store().list_profiles();
+                    ui.kit = self.shared.kit();
+                    ui.note_mode = NoteMode::default_for(&ui.kit);
+                    ui.profiles = list_profiles(&self.shared);
                     if ui.view == View::Stats {
                         self.load_stats(ui);
                     }
@@ -615,7 +654,7 @@ impl Editor {
     }
 
     fn draw_counter(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
-        let w = WIDTH as f32;
+        let w = self.w();
         // The logo, top left.
         let logo_w = self.draw_logo(c, 26.0, 38.0, 26.0);
 
@@ -649,8 +688,10 @@ impl Editor {
         self.text(c, r.x + 34.0, r.y + r.h / 2.0, "Stats", 14.0, color, Align::Left);
         ui.regions.push((r, Action::ShowStats));
 
-        // Drums, left of Stats.
+        // Drums, left of Stats (MIDI profiles only).
+        let audio = ui.snapshot.audio;
         let r = Rect::new(w - 196.0, 14.0, 92.0, 32.0);
+        if !audio {
         let hovered = r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None);
         if hovered {
             Self::rounded(c, r, 4.0, Some(theme::hover_fill()), None);
@@ -670,16 +711,19 @@ impl Editor {
         c.stroke_path(&p, &Paint::color(color).with_line_width(1.1));
         self.text(c, r.x + 36.0, r.y + r.h / 2.0, "Drums", 14.0, color, Align::Left);
         ui.regions.push((r, Action::ShowKit));
+        }
 
-        // The count.
-        let s = commas(ui.snapshot.total);
+        // The count, in the middle of the space below the top bar: notes, or time played as a
+        // running clock.
+        let dy = self.extra().1 / 2.0;
+        let s = if audio { clock(ui.snapshot.total) } else { commas(ui.snapshot.total) };
         let mut size = 132.0;
         let tw = self.measure(c, &s, size, 200.0);
         if tw > w - 80.0 {
             size *= (w - 80.0) / tw;
         }
         let tw = self.measure(c, &s, size, 200.0);
-        let (cx, cy) = (w / 2.0, 208.0);
+        let (cx, cy) = (w / 2.0, 208.0 + dy);
         let paint = theme::gradient(cx - tw / 2.0, cy - size * 0.4, cx + tw / 2.0, cy + size * 0.4, 255)
             .with_font(&[self.font])
             .with_font_size(size)
@@ -688,21 +732,36 @@ impl Editor {
             .with_text_baseline(Baseline::Middle);
         let _ = c.fill_text(cx, cy, &s, &paint);
 
-        self.label(c, cx, 300.0, "notes played", theme::dim(), Align::Center);
-        let mut today = format!("Today  {}", commas(ui.snapshot.today));
+        if audio {
+            // A dot that lights while the signal is coming in.
+            let label = if ui.snapshot.playing { "playing" } else { "time played" };
+            let lw = self.label(c, cx, 300.0 + dy, label, theme::dim(), Align::Center);
+            let mut p = Path::new();
+            p.circle(cx - lw / 2.0 - 12.0, 300.0 + dy, 3.0);
+            if ui.snapshot.playing {
+                c.fill_path(&p, &theme::window_gradient(255));
+            } else {
+                c.stroke_path(&p, &Paint::color(theme::faint()).with_line_width(1.0));
+            }
+        } else {
+            self.label(c, cx, 300.0 + dy, "notes played", theme::dim(), Align::Center);
+        }
+        let today_s = if audio { clock(ui.snapshot.today) } else { commas(ui.snapshot.today) };
+        let mut today = format!("Today  {today_s}");
         if ui.snapshot.streak >= 2 {
             today.push_str(&format!("   ·   {}-day streak", ui.snapshot.streak));
         }
-        self.text(c, cx, 332.0, &today, 14.0, theme::faint().with_alpha(170), Align::Center);
+        self.text(c, cx, 332.0 + dy, &today, 14.0, theme::faint().with_alpha(170), Align::Center);
 
         if let Some(cheer) = &ui.snapshot.cheer {
             let s = match cheer {
+                Cheer::Milestone(m) if audio => format!("{} hours played!", commas(*m / 3600)),
                 Cheer::Milestone(m) => format!("{} notes!", commas(*m)),
                 Cheer::BestDay => "Your best day yet".to_string(),
                 Cheer::BestMinute(n) => format!("Your busiest minute yet: {} notes", commas(*n)),
             };
             let sw = self.measure(c, &s, 16.0, 300.0);
-            self.gradient_text(c, cx, 372.0, &s, 16.0, sw, Align::Center);
+            self.gradient_text(c, cx, 372.0 + dy, &s, 16.0, sw, Align::Center);
         }
         if let Some(t) = ui.cheer_started.filter(|t| t.elapsed() < CHEER_ANIMATION) {
             Self::sparkle(c, cx, cy, t.elapsed().as_secs_f32() / CHEER_ANIMATION.as_secs_f32());
@@ -774,7 +833,7 @@ impl Editor {
 
     fn draw_profiles(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, scroll: &mut usize) {
         // Click outside closes.
-        ui.regions.push((Rect::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Action::CloseOverlay));
+        ui.regions.push((Rect::new(0.0, 0.0, self.w(), self.h()), Action::CloseOverlay));
         let current = ui.snapshot.profile.clone();
         let item_h = 32.0;
         let max_items = 10usize;
@@ -785,7 +844,7 @@ impl Editor {
         Self::rounded(c, panel, 6.0, Some(theme::popup_fill()), Some(Paint::color(theme::hairline())));
         ui.regions.push((panel, Action::None));
         let mut y = panel.y + 4.0;
-        for name in ui.profiles.iter().skip(*scroll).take(shown).cloned().collect::<Vec<_>>() {
+        for (name, audio) in ui.profiles.iter().skip(*scroll).take(shown).cloned().collect::<Vec<_>>() {
             let r = Rect::new(panel.x + 4.0, y, panel.w - 8.0, item_h);
             if r.contains(ui.mouse) {
                 Self::rounded(c, r, 4.0, Some(theme::hover_fill()), None);
@@ -798,6 +857,9 @@ impl Editor {
             }
             let color = if selected { theme::text() } else { theme::text().with_alpha(170) };
             self.text(c, r.x + 28.0, r.y + r.h / 2.0, &name, 14.0, color, Align::Left);
+            if audio {
+                self.text(c, r.x + r.w - 12.0, r.y + r.h / 2.0, "audio", 11.5, theme::faint(), Align::Right);
+            }
             ui.regions.push((r, Action::SelectProfile(name)));
             y += item_h;
         }
@@ -817,13 +879,13 @@ impl Editor {
         ui.regions.push((r, Action::NewProfile));
     }
 
-    fn draw_new_profile(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, text: &str, error: Option<&str>) {
-        let (w, h) = (WIDTH as f32, HEIGHT as f32);
+    fn draw_new_profile(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, text: &str, error: Option<&str>, audio: bool) {
+        let (w, h) = (self.w(), self.h());
         let mut p = Path::new();
         p.rect(0.0, 0.0, w, h);
         c.fill_path(&p, &Paint::color(Color::rgba(0, 0, 0, 150)));
         ui.regions.push((Rect::new(0.0, 0.0, w, h), Action::None));
-        let panel = Rect::new(w / 2.0 - 190.0, h / 2.0 - 95.0, 380.0, 190.0);
+        let panel = Rect::new(w / 2.0 - 190.0, h / 2.0 - 120.0, 380.0, 240.0);
         Self::rounded(c, panel, 8.0, Some(theme::popup_fill()), Some(theme::window_gradient(140)));
         self.label(c, panel.x + 24.0, panel.y + 30.0, "New profile", theme::dim(), Align::Left);
 
@@ -831,7 +893,8 @@ impl Editor {
         Self::rounded(c, field, 4.0, Some(Color::rgba(0, 0, 0, 120)), Some(Paint::color(theme::hairline())));
         ui.regions.push((field, Action::Field));
         let tw = if text.is_empty() {
-            self.text(c, field.x + 12.0, field.y + field.h / 2.0, "Drums, Keys, …", 15.0, theme::faint(), Align::Left);
+            let hint = if audio { "Bass, Vocals, …" } else { "Drums, Keys, …" };
+            self.text(c, field.x + 12.0, field.y + field.h / 2.0, hint, 15.0, theme::faint(), Align::Left);
             0.0
         } else {
             self.text(c, field.x + 12.0, field.y + field.h / 2.0, text, 15.0, theme::text(), Align::Left)
@@ -840,8 +903,22 @@ impl Editor {
         caret.rect(field.x + 12.0 + tw + 1.0, field.y + 10.0, 1.0, field.h - 20.0);
         c.fill_path(&caret, &theme::window_gradient(255));
 
+        // What it counts: MIDI notes, or time with an audio signal.
+        let half = (field.w - 4.0) / 2.0;
+        for (i, (label, a)) in [("MIDI · notes", false), ("Audio · time", true)].into_iter().enumerate() {
+            let r = Rect::new(field.x + i as f32 * (half + 4.0), panel.y + 100.0, half, 30.0);
+            let selected = audio == a;
+            let hovered = r.contains(ui.mouse);
+            let stroke = if selected { theme::window_gradient(200) } else { Paint::color(theme::hairline()) };
+            Self::rounded(c, r, 4.0, hovered.then(theme::hover_fill), Some(stroke));
+            let color = if selected || hovered { theme::text() } else { theme::dim() };
+            self.text(c, r.x + r.w / 2.0, r.y + r.h / 2.0, label, 13.5, color, Align::Center);
+            ui.regions.push((r, Action::NewProfileAudio(a)));
+        }
+        let about = if audio { "Counts the time a signal comes in, by the second" } else { "Counts every note played" };
+        self.text(c, field.x, panel.y + 146.0, about, 12.0, theme::faint(), Align::Left);
         if let Some(e) = error {
-            self.text(c, panel.x + 24.0, panel.y + 108.0, e, 12.5, Color::rgba(240, 150, 170, 220), Align::Left);
+            self.text(c, panel.x + 24.0, panel.y + 166.0, e, 12.5, Color::rgba(240, 150, 170, 220), Align::Left);
         }
         let cancel = Rect::new(panel.x + panel.w - 210.0, panel.y + panel.h - 54.0, 88.0, 32.0);
         let create = Rect::new(panel.x + panel.w - 112.0, panel.y + panel.h - 54.0, 88.0, 32.0);
@@ -911,7 +988,7 @@ impl Editor {
         let w = self.measure(c, title, 12.5, 300.0).max(self.measure(c, value, 15.0, 300.0)) + 24.0;
         let h = 46.0;
         let mut x = ui.mouse.0 + 14.0;
-        if x + w > WIDTH as f32 - 8.0 {
+        if x + w > self.w() - 8.0 {
             x = ui.mouse.0 - 14.0 - w;
         }
         let y = (ui.mouse.1 - h - 10.0).max(8.0);
@@ -927,13 +1004,14 @@ impl Editor {
     }
 
     fn draw_stats(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
-        let w = WIDTH as f32;
+        let w = self.w();
         // Top bar: back, profile, pages.
         self.top_bar(c, ui);
         let kit_page = if ui.kit.is_drums() { "Kit" } else { "Keys" };
         let pages = [(Page::Overview, "Overview"), (Page::Rhythm, "Rhythm"), (Page::Kit, kit_page), (Page::Habits, "Habits"), (Page::Review, "Review")];
+        let audio = ui.kit.is_audio();
         let mut x = w - 16.0;
-        for (page, name) in pages.iter().rev() {
+        for (page, name) in pages.iter().rev().filter(|(p, _)| !audio || matches!(p, Page::Overview | Page::Habits)) {
             let bw = if *page == Page::Overview { 76.0 } else { 64.0 };
             x -= bw;
             self.button(c, ui, Rect::new(x, 12.0, bw, 32.0), name, ui.page == *page, Action::Page(*page));
@@ -979,7 +1057,7 @@ impl Editor {
             self.button(c, ui, Rect::new(sx, 60.0, bw, 30.0), span.label(), q.span == *span, Action::Span(*span));
         }
         if ui.stats.is_some() {
-            let total_s = format!("{} notes", commas(total));
+            let total_s = if audio { format!("{} played", seconds_text(total)) } else { format!("{} notes", commas(total)) };
             let tx = x + if q.span != Span::All { 44.0 } else { 8.0 };
             if tx + self.measure(c, &total_s, 15.0, 300.0) < sx - 8.0 {
                 self.gradient_text(c, tx, 75.0, &total_s, 15.0, 160.0, Align::Left);
@@ -1025,11 +1103,13 @@ impl Editor {
     }
 
     fn draw_overview(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats) {
-        let w = WIDTH as f32;
+        let w = self.w();
         let q = ui.query;
+        let audio = ui.kit.is_audio();
         // Time played, pace and averages.
         if stats.total > 0 {
-            self.parts_line(c, ui, 16.0, 106.0, w - 16.0, summary(stats));
+            let parts = if audio { audio_summary(stats) } else { summary(stats) };
+            self.parts_line(c, ui, 16.0, 106.0, w - 16.0, parts);
         }
 
         // Bucket size on the left, what the timeline shows on the right.
@@ -1052,19 +1132,39 @@ impl Editor {
             (ChartMode::Timing, "Timing", 56.0),
         ];
         let mut mx = w - 16.0;
-        for (mode, name, mw) in modes.iter().rev() {
+        // An audio profile's timeline only shows time.
+        for (mode, name, mw) in modes.iter().rev().filter(|_| !audio) {
             mx -= mw;
             self.small_toggle(c, ui, Rect::new(mx, 122.0, *mw, 24.0), name, ui.chart_mode == *mode, Action::ChartMode(*mode));
             mx -= 2.0;
         }
 
         // Timeline.
-        let chart = Rect::new(60.0, 156.0, w - 76.0, 104.0);
+        let ey = self.extra().1;
+        // Audio profiles have no notes or velocities: the timeline takes the whole page.
+        let chart_h = if audio { 264.0 + ey } else { 104.0 + ey * 0.4 };
+        let chart = Rect::new(60.0, 156.0, w - 76.0, chart_h);
         Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h, theme::hairline());
         Self::hline(c, chart.x, chart.x + chart.w, chart.y, theme::hairline().with_alpha(10));
         Self::hline(c, chart.x, chart.x + chart.w, chart.y + chart.h / 2.0, theme::hairline().with_alpha(10));
         let n = stats.counts.len();
         match ui.chart_mode {
+            _ if audio => {
+                let max = stats.counts.iter().copied().max().unwrap_or(0);
+                let axis = |v: u64| if max < 120 { format!("{v}s") } else { theme::short_duration(v as f64 / 60.0) };
+                if max > 0 {
+                    self.text(c, chart.x - 8.0, chart.y, &axis(max), 11.0, theme::faint(), Align::Right);
+                    self.text(c, chart.x - 8.0, chart.y + chart.h / 2.0, &axis(max / 2), 11.0, theme::faint(), Align::Right);
+                }
+                self.text(c, chart.x - 8.0, chart.y + chart.h, "0", 11.0, theme::faint(), Align::Right);
+                self.bars_with(c, ui, chart, &stats.counts, &|i| {
+                    let value = match stats.counts[i] {
+                        0 => "Not played".to_string(),
+                        n => format!("{} played", seconds_text(n)),
+                    };
+                    (stats.bucket_label(i), value)
+                });
+            }
             ChartMode::Notes | ChartMode::Time => {
                 let time = ui.chart_mode == ChartMode::Time;
                 // In time mode the bars are seconds of (estimated) playing.
@@ -1136,11 +1236,17 @@ impl Editor {
             self.text(c, chart.x + i as f32 * slot + slot / 2.0, chart.y + chart.h + 14.0, &stats.axis_label(i), 11.0, theme::faint(), Align::Center);
         }
         if stats.total == 0 && !ui.loading {
-            self.text(c, chart.x + chart.w / 2.0, chart.y + chart.h / 2.0, "No notes in this range", 14.0, theme::dim(), Align::Center);
+            let s = if audio { "Nothing played in this range" } else { "No notes in this range" };
+            self.text(c, chart.x + chart.w / 2.0, chart.y + chart.h / 2.0, s, 14.0, theme::dim(), Align::Center);
+        }
+        if audio {
+            return;
         }
 
-        self.draw_notes(c, ui, stats, Rect::new(16.0, 292.0, 470.0, 144.0));
-        self.draw_velocity(c, ui, stats, Rect::new(500.0, 292.0, w - 516.0, 144.0));
+        let (lw, rx, rw) = self.columns(470.0, 500.0);
+        let y = 292.0 + ey * 0.4;
+        self.draw_notes(c, ui, stats, Rect::new(16.0, y, lw, 144.0 + ey * 0.6));
+        self.draw_velocity(c, ui, stats, Rect::new(rx, y, rw, 144.0 + ey * 0.6));
     }
 
     /// Values per bucket as dots joined by a line (gaps where there's no value), on a scale fitted
@@ -1311,13 +1417,13 @@ impl Editor {
         unsafe { self.gl.make_current() }.map_err(|e| handler_error(e.to_string()))?;
         let size = self.ctx.size();
         let (pw, ph) = (size.physical.width, size.physical.height);
-        let (scale, ox, oy) = self.layout();
+        let (scale, lw, lh) = self.layout();
+        self.dims.set((lw, lh));
         let mut canvas = self.canvas.borrow_mut();
         let c = &mut *canvas;
         c.set_size(pw, ph, 1.0);
         c.clear_rect(0, 0, pw, ph, theme::background());
         c.reset_transform();
-        c.translate(ox, oy);
         c.scale(scale, scale);
 
         let mut ui = self.ui.borrow_mut();
@@ -1329,6 +1435,15 @@ impl Editor {
         }
         ui.snapshot = self.shared.snapshot();
         ui.kit = self.shared.kit();
+        // An audio profile has no drums view and only the overview and habits pages.
+        if ui.kit.is_audio() {
+            if ui.view == View::Kit {
+                ui.view = View::Counter;
+            }
+            if !matches!(ui.page, Page::Overview | Page::Habits) {
+                ui.page = Page::Overview;
+            }
+        }
         // A new celebration sparkles (a busier minute than the last busiest doesn't again).
         let kind = |c: &Option<Cheer>| match c {
             Some(Cheer::Milestone(m)) => Some((0, *m)),
@@ -1359,9 +1474,9 @@ impl Editor {
                 self.draw_profiles(c, ui, &mut s);
                 *scroll = s;
             }
-            Overlay::NewProfile { text, error } => {
-                ui.overlay = Overlay::NewProfile { text: String::new(), error: None };
-                self.draw_new_profile(c, ui, text, error.as_deref());
+            Overlay::NewProfile { text, error, audio } => {
+                ui.overlay = Overlay::NewProfile { text: String::new(), error: None, audio: *audio };
+                self.draw_new_profile(c, ui, text, error.as_deref(), *audio);
             }
             Overlay::Learn { .. } => {
                 ui.overlay = Overlay::Learn { since: 0 };
@@ -1406,7 +1521,7 @@ impl Editor {
             return matches!(ui.overlay, Overlay::NewProfile { .. } | Overlay::NameDrum { .. });
         }
         match &mut ui.overlay {
-            Overlay::NewProfile { text, error } => {
+            Overlay::NewProfile { text, error, .. } => {
                 match &ev.key {
                     Key::Named(NamedKey::Enter) => {
                         self.create_profile(ui);
@@ -1497,12 +1612,12 @@ impl WindowHandler for Editor {
     }
 
     fn on_event(&self, event: Event) -> EventStatus {
-        let (scale, ox, oy) = self.layout();
+        let (scale, _, _) = self.layout();
         let mut ui = self.ui.borrow_mut();
         let ui = &mut *ui;
         match event {
             Event::Mouse(MouseEvent::CursorMoved { position, .. }) => {
-                ui.mouse = ((position.x as f32 - ox) / scale, (position.y as f32 - oy) / scale);
+                ui.mouse = (position.x as f32 / scale, position.y as f32 / scale);
                 self.update_cursor(ui);
                 if Self::hover_state(ui) != ui.drawn_hover {
                     self.ctx.request_redraw();
@@ -1561,7 +1676,6 @@ impl WindowHandler for Editor {
     }
 }
 
-/// Fits the 800 × 450 layout into a `w` × `h` window: (scale, x offset, y offset).
 /// The time played in a bucket, for its tooltip: "about 35 min · 41 logged", or in seconds for a
 /// minute. Without a pace the logged minutes are all there is.
 fn played_text(played: f64, logged: u32, estimated: bool, minute: bool) -> String {
@@ -1612,17 +1726,64 @@ fn summary(s: &Stats) -> Vec<(String, Option<(String, String)>)> {
     parts
 }
 
+/// The profiles, and whether each is an audio profile.
+fn list_profiles(shared: &Shared) -> Vec<(String, bool)> {
+    let store = shared.store();
+    store.list_profiles().into_iter().map(|n| {
+        let audio = Kit::load(&store.profile_dir(&n)).is_audio();
+        (n, audio)
+    }).collect()
+}
+
+/// Seconds as a running clock: "0:04:09", "12:30:00", "1,204:00:13".
+pub fn clock(seconds: u64) -> String {
+    format!("{}:{:02}:{:02}", commas(seconds / 3600), seconds / 60 % 60, seconds % 60)
+}
+
+/// Seconds as "45 s" under a minute, else as a duration ("3 h 05 min").
+pub fn seconds_text(seconds: u64) -> String {
+    if seconds < 60 { format!("{seconds} s") } else { theme::duration(seconds as f64 / 60.0) }
+}
+
+/// An audio profile's line under the range: time played, sessions, and the average per bucket.
+fn audio_summary(s: &Stats) -> Vec<(String, Option<(String, String)>)> {
+    let mut parts = vec![(format!("{} played", seconds_text(s.total)), None)];
+    let n = s.sessions.len();
+    if n > 0 {
+        let longest = s.sessions.iter().map(|x| x.hits).max().unwrap_or(0);
+        parts.push((
+            format!("{n} session{}, the longest {}", if n == 1 { "" } else { "s" }, seconds_text(longest)),
+            Some(("A session ends after".to_string(), format!("{} minutes without playing", stats::SESSION_GAP))),
+        ));
+    }
+    let per = match s.query.bucket {
+        Bucket::Minute => None,
+        Bucket::Hour => Some("an hour"),
+        Bucket::Day => Some("a day"),
+        Bucket::Week => Some("a week"),
+        Bucket::Month => Some("a month"),
+        Bucket::Year => Some("a year"),
+    };
+    if let Some(per) = per.filter(|_| s.elapsed > 1) {
+        parts.push((
+            format!("{} {per}", seconds_text((s.total as f64 / s.elapsed as f64).round() as u64)),
+            Some((format!("On average, over the {} so far", plural(s)), "including the ones you didn't play".to_string())),
+        ));
+    }
+    parts
+}
+
 /// "5 days", "1 week": how many buckets have started.
 fn plural(s: &Stats) -> String {
     let unit = s.query.bucket.label().to_lowercase();
     if s.elapsed == 1 { format!("1 {unit}") } else { format!("{} {unit}s", s.elapsed) }
 }
 
+/// Fits the 800 × 450 layout into a `w` × `h` window: (scale, layout width, layout height). The
+/// scale makes 800 × 450 fit; the layout then fills the window, wider or taller than that.
 fn fit(w: f32, h: f32) -> (f32, f32, f32) {
     let scale = (w / WIDTH as f32).min(h / HEIGHT as f32).max(0.01);
-    let ox = ((w - WIDTH as f32 * scale) / 2.0).max(0.0).floor();
-    let oy = ((h - HEIGHT as f32 * scale) / 2.0).max(0.0).floor();
-    (scale, ox, oy)
+    (scale, (w / scale).max(WIDTH as f32), (h / scale).max(HEIGHT as f32))
 }
 
 fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) {
@@ -1677,10 +1838,11 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn fit_keeps_the_shape() {
-        assert_eq!(super::fit(800.0, 450.0), (1.0, 0.0, 0.0));
-        assert_eq!(super::fit(1600.0, 900.0), (2.0, 0.0, 0.0));
-        assert_eq!(super::fit(1000.0, 450.0), (1.0, 100.0, 0.0));
-        assert_eq!(super::fit(800.0, 650.0), (1.0, 0.0, 100.0));
+    fn fit_fills_the_window() {
+        assert_eq!(super::fit(800.0, 450.0), (1.0, 800.0, 450.0));
+        assert_eq!(super::fit(1600.0, 900.0), (2.0, 800.0, 450.0));
+        assert_eq!(super::fit(1000.0, 450.0), (1.0, 1000.0, 450.0));
+        assert_eq!(super::fit(800.0, 650.0), (1.0, 800.0, 650.0));
+        assert_eq!(super::fit(1600.0, 1800.0), (2.0, 800.0, 900.0));
     }
 }

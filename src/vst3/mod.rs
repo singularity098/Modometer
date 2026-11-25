@@ -10,6 +10,9 @@
 //! It asks the host for its tempo and transport state, to log the project tempo while it plays.
 //! If the profile reads the hi-hat pedal, it maps that MIDI CC (via `IMidiMapping`) to its one
 //! parameter, "Hi-hat pedal", which only ever reads.
+//!
+//! On an audio profile it ignores MIDI and instead watches the audio input's peak level, to log the
+//! time played (see [`crate::session`]). On MIDI profiles the audio is only copied.
 
 mod view;
 
@@ -22,7 +25,7 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{uid, Class, ComRef, ComWrapper};
 
-use crate::session::{Guard, Shared, NO_PEDAL};
+use crate::session::{self, AudioGate, Guard, Shared, NO_PEDAL};
 use crate::store::{self, Store};
 
 /// The hi-hat pedal parameter, fed by the host from the pedal's MIDI CC.
@@ -61,6 +64,7 @@ pub struct Modometer {
     sample64: Cell<bool>,
     // Audio thread only: the retrigger guard, a sample clock and the sample rate.
     guard: RefCell<Guard>,
+    gate: RefCell<AudioGate>,
     clock: Cell<u64>,
     rate: Cell<f64>,
     /// The pedal parameter's last value (controller side).
@@ -85,6 +89,7 @@ impl Modometer {
             shared: Shared::new(Store::new(store::default_root())),
             sample64: Cell::new(false),
             guard: RefCell::new(Guard::default()),
+            gate: RefCell::new(AudioGate::default()),
             clock: Cell::new(0),
             rate: Cell::new(48000.0),
             pedal: Cell::new(0.0),
@@ -201,6 +206,12 @@ impl IComponentTrait for Modometer {
                 if let Some(z) = line.strip_prefix("zoom ").and_then(|z| z.trim().parse::<f32>().ok()) {
                     self.shared.set_zoom(z);
                 }
+                // Written after the zoom, so it wins (versions before free resizing read the zoom).
+                if let Some((w, h)) = line.strip_prefix("size ").and_then(|s| s.trim().split_once(' ')) {
+                    if let (Ok(w), Ok(h)) = (w.trim().parse::<f32>(), h.trim().parse::<f32>()) {
+                        self.shared.set_editor_size(w, h);
+                    }
+                }
             }
         }
         kResultOk
@@ -211,9 +222,16 @@ impl IComponentTrait for Modometer {
         let mut bytes = STATE_MAGIC.to_vec();
         bytes.extend_from_slice(self.shared.profile_name().as_bytes());
         bytes.push(b'\n');
+        // The editor's size: a zoom for a 16:9 size (which older versions read too), and the size
+        // itself for any other shape.
         let zoom = self.shared.zoom();
-        if (zoom - 1.0).abs() > 0.001 {
+        let (w, h) = self.shared.editor_size();
+        let wide = (w / session::EDITOR_SIZE.0 - h / session::EDITOR_SIZE.1).abs() > 0.002;
+        if (zoom - 1.0).abs() > 0.001 || wide {
             bytes.extend_from_slice(format!("zoom {zoom:.3}\n").as_bytes());
+        }
+        if wide {
+            bytes.extend_from_slice(format!("size {w:.0} {h:.0}\n").as_bytes());
         }
         let mut written = 0;
         if stream.write(bytes.as_ptr() as *mut c_void, bytes.len() as i32, &mut written) == kResultOk {
@@ -273,15 +291,25 @@ impl IAudioProcessorTrait for Modometer {
         if let Ok(mut g) = self.guard.try_borrow_mut() {
             g.reset();
         }
+        if let Ok(mut g) = self.gate.try_borrow_mut() {
+            g.reset();
+        }
+        self.shared.stop_playing();
         kResultOk
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let Some(data) = data.as_ref() else { return kResultOk };
 
-        // Count note-ons (note-on with velocity 0 is a note-off), through the retrigger guard.
         let clock = self.clock.get();
-        if let Ok(mut guard) = self.guard.try_borrow_mut() {
+        if self.shared.is_audio() {
+            // Time played: is there a signal?
+            if let Ok(mut gate) = self.gate.try_borrow_mut() {
+                let peak = self.input_peak(data);
+                self.shared.audio_block(&mut gate, clock, data.numSamples.max(0) as u64, self.rate.get(), peak);
+            }
+        } else if let Ok(mut guard) = self.guard.try_borrow_mut() {
+            // Count note-ons (note-on with velocity 0 is a note-off), through the retrigger guard.
             self.count(data, &mut guard, clock);
         }
         self.clock.set(clock + data.numSamples.max(0) as u64);
@@ -358,6 +386,36 @@ impl Modometer {
         if self.shared.pedal_cc() == 0 {
             guard.pedal = NO_PEDAL;
         }
+    }
+
+    /// The input's peak level this block, over all channels (0 if the host says they're silent).
+    unsafe fn input_peak(&self, data: &ProcessData) -> f32 {
+        let n = data.numSamples.max(0) as usize;
+        if data.numInputs < 1 || n == 0 || data.inputs.is_null() {
+            return 0.0;
+        }
+        let inp = &*data.inputs;
+        if inp.__field0.channelBuffers32.is_null() {
+            return 0.0;
+        }
+        let mut peak = 0.0f32;
+        for ch in 0..inp.numChannels.max(0) as usize {
+            if ch < 64 && inp.silenceFlags & (1 << ch) != 0 {
+                continue;
+            }
+            if data.symbolicSampleSize == SymbolicSampleSizes_::kSample64 as i32 {
+                let p = *inp.__field0.channelBuffers64.add(ch);
+                if !p.is_null() {
+                    peak = peak.max(session::peak64(std::slice::from_raw_parts(p, n)));
+                }
+            } else {
+                let p = *inp.__field0.channelBuffers32.add(ch);
+                if !p.is_null() {
+                    peak = peak.max(session::peak32(std::slice::from_raw_parts(p, n)));
+                }
+            }
+        }
+        peak
     }
 
     unsafe fn copy_audio(&self, data: &ProcessData) {

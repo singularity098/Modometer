@@ -5,6 +5,9 @@ A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
 ![Modometer](docs/images/counter.png)
 
 - Counts every MIDI note-on, per **profile** ("Drums" in one instance, "Keys" in another).
+- **Audio profiles** count time instead: for an instrument that sends audio (bass, guitar, vocals),
+  the counter is a clock of the time you've played, going up by the second while a signal comes in
+  and stopping after 4 seconds of silence (see "Audio profiles" below).
 - **One hit, one count**: e-drum pads often send a burst of notes for one strike (double triggers).
   A retrigger guard counts repeats of the same drum within 30 ms once (adjustable per profile).
 - **Drum map**: name your pads ("Snare", "Crash 2", anything) with **Learn**, per profile, and see
@@ -29,8 +32,8 @@ A VST3 plugin for Linux, by Kaia, that counts every note you play, forever.
   personal bests. **Review**: the highlights of any range, a "year in review" for a year.
 - The counter screen shows your streak, and celebrates milestones (1,000 notes, 10,000, ...,
   1,000,000 ...), your best day and your busiest minute.
-- The window can be resized: drag the edge of the plugin window and everything scales, keeping its
-  shape. Each instance remembers its size.
+- The window can be resized to any size and shape: drag the edge of the plugin window and the layout
+  scales and stretches to fill it. Each instance remembers its size.
 - Very light: the audio thread only pushes a few bytes per note into a lock-free queue. The window
   draws only when something changes. Saves happen every 30 seconds, and only if you played.
 
@@ -50,6 +53,24 @@ your playing, put it in the track's **Input FX**, not the normal FX chain:
 
 Input FX only see the live input, so playback is never counted. Put your instrument in the normal FX
 chain as usual. Each instance has its own profile, saved with the project.
+
+## Audio profiles: time played
+
+When you create a profile (profile menu, **New profile…**), pick **MIDI · notes** (the usual note
+counter) or **Audio · time**. An audio profile ignores MIDI and listens to the audio coming through
+the plugin instead:
+
+- Playing is a signal louder than -50 dBFS. While it comes in, the counter (hours:minutes:seconds)
+  goes up by the second and shows **playing**.
+- Short pauses keep the clock running. After 4 seconds of silence it stops, until you play again.
+  Those 4 seconds count as playing (the clock showed them).
+- The stats show the time played on the timeline and in the habits (calendar, when you play,
+  sessions, best day and week). The note pages (rhythm, keys, review) don't apply.
+- Put it in the track's Input FX like the MIDI counter, so only your live input is timed. The audio
+  still passes through untouched.
+
+To change the threshold, edit `audio-threshold-db -50` in the profile's `settings.txt` (a noisy
+pickup may need -40). A profile's type is set when it's created; MIDI profiles work as before.
 
 ## Drums: names, Learn and the retrigger guard
 
@@ -170,6 +191,9 @@ That's the UTC minute, the number of notes, then how often each note (`n`) and e
 came up. More fields follow with the analysis (tempo, timing, ...), listed in
 [docs/Requirements.md](docs/Requirements.md). Files are only ever appended to.
 
+An audio profile's lines hold seconds of playing instead of notes (`2026-11-05T15:04Z 42`), and its
+`settings.txt` starts with `type audio`.
+
 When a month is over (from the month after next), Modometer compacts it: one line per minute,
 gzipped, as `2026-09.log.gz`. Read it with `zcat` or `zless`. That keeps a year of playing to a few
 MB and one file per month. Older versions of the plugin don't read compacted months.
@@ -186,8 +210,8 @@ cargo run --example preview
 
 `preview` opens the window on its own with made-up data (`--stats` or `--kit` to start on the stats
 or drums view, `--page rhythm|kit|habits|review` for a stats page, `--chart velocity|tempo|timing`
-for the timeline, `--profile Drums` for the drum kit, `--screenshot file.png` to save a frame and
-exit). `embed_test` (`-- 6 --resize` to test resizing) embeds the editor into a parent
+for the timeline, `--profile Drums` for the drum kit, `--profile Bass` for an audio profile,
+`--size 1200x500` for another window size, `--screenshot file.png` to save a frame and exit). `embed_test` (`-- 6 --resize` to test resizing) embeds the editor into a parent
 window through the VST3 view interface, as a host does.
 
 ## License

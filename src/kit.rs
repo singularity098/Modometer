@@ -19,6 +19,10 @@
 //!
 //! A profile with at least one named drum is a drum kit: its hits get the drum analysis (rolls,
 //! fills, per-drum dynamics). Others get the keys analysis (chords, intervals).
+//!
+//! `type audio` makes the profile an audio profile: instead of notes it logs the seconds an audio
+//! signal (louder than `audio-threshold-db`, default -50 dBFS) passed through. Without the line
+//! the profile counts MIDI notes, as profiles always have.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -40,6 +44,18 @@ pub const PRESETS: [&str; 16] = [
 
 /// The usual hi-hat pedal controller (MIDI CC 4, "foot controller").
 pub const PEDAL_CC: u8 = 4;
+/// An audio profile's default signal threshold: anything quieter is silence.
+pub const DEFAULT_THRESHOLD_DB: i32 = -50;
+
+/// What a profile tracks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    /// MIDI note-ons, counted one by one.
+    #[default]
+    Midi,
+    /// Time with an audio signal, in seconds.
+    Audio,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Kit {
@@ -48,11 +64,20 @@ pub struct Kit {
     pub names: BTreeMap<u8, String>,
     /// The MIDI CC of the hi-hat pedal, or 0 to not read it.
     pub pedal_cc: u8,
+    pub kind: Kind,
+    /// Audio profiles: the level (dBFS) a signal must reach to count as playing.
+    pub threshold_db: i32,
 }
 
 impl Default for Kit {
     fn default() -> Self {
-        Kit { retrigger_ms: DEFAULT_RETRIGGER_MS, names: BTreeMap::new(), pedal_cc: 0 }
+        Kit {
+            retrigger_ms: DEFAULT_RETRIGGER_MS,
+            names: BTreeMap::new(),
+            pedal_cc: 0,
+            kind: Kind::Midi,
+            threshold_db: DEFAULT_THRESHOLD_DB,
+        }
     }
 }
 
@@ -122,6 +147,14 @@ impl Kit {
                 if let Ok(cc) = cc.trim().parse::<u8>() {
                     kit.pedal_cc = cc.min(127);
                 }
+            } else if let Some(kind) = line.strip_prefix("type ") {
+                if kind.trim().eq_ignore_ascii_case("audio") {
+                    kit.kind = Kind::Audio;
+                }
+            } else if let Some(db) = line.strip_prefix("audio-threshold-db ") {
+                if let Ok(db) = db.trim().parse::<i32>() {
+                    kit.threshold_db = db.clamp(-120, 0);
+                }
             } else if let Some(rest) = line.strip_prefix("note ") {
                 let (note, name) = rest.trim().split_once(' ').unwrap_or((rest, ""));
                 if let (Ok(note), Ok(name)) = (note.parse::<u8>(), clean_drum_name(name)) {
@@ -138,6 +171,10 @@ impl Kit {
         let mut s = String::from(
             "# Modometer settings for this profile. The plugin rewrites this file when you change them.\n",
         );
+        if self.kind == Kind::Audio {
+            let _ = writeln!(s, "type audio");
+            let _ = writeln!(s, "audio-threshold-db {}", self.threshold_db);
+        }
         let _ = writeln!(s, "retrigger-ms {}", self.retrigger_ms);
         if self.pedal_cc > 0 {
             let _ = writeln!(s, "hihat-pedal-cc {}", self.pedal_cc);
@@ -167,7 +204,17 @@ impl Kit {
 
     /// A drum kit (some drums are named), as opposed to keys.
     pub fn is_drums(&self) -> bool {
-        !self.names.is_empty()
+        self.kind == Kind::Midi && !self.names.is_empty()
+    }
+
+    /// An audio profile: it logs seconds of signal, not notes.
+    pub fn is_audio(&self) -> bool {
+        self.kind == Kind::Audio
+    }
+
+    /// The audio threshold as a linear peak level.
+    pub fn threshold(&self) -> f32 {
+        10f32.powf(self.threshold_db as f32 / 20.0)
     }
 
     /// Each note's role: from its name, else from General MIDI.
@@ -235,6 +282,19 @@ mod tests {
         assert_eq!(Kit::parse(&kit.format()), kit);
         kit.pedal_cc = PEDAL_CC;
         assert_eq!(Kit::parse(&kit.format()), kit);
+        // MIDI profiles don't write a type line, so their files read as before.
+        assert!(!kit.format().contains("type"));
+    }
+
+    #[test]
+    fn audio_profiles() {
+        let kit = Kit { kind: Kind::Audio, threshold_db: -42, ..Kit::default() };
+        let parsed = Kit::parse(&kit.format());
+        assert_eq!(parsed, kit);
+        assert!(parsed.is_audio());
+        assert!(!parsed.is_drums());
+        assert!((Kit::parse("type audio\n").threshold() - 0.003_162).abs() < 1e-5);
+        assert_eq!(Kit::parse("type midi\n").kind, Kind::Midi);
     }
 
     #[test]

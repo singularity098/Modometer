@@ -82,8 +82,10 @@ impl Editor {
     // ---- Rhythm ----
 
     pub(super) fn draw_rhythm(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats) {
-        self.draw_tempo(c, ui, stats, Rect::new(16.0, 100.0, 376.0, 336.0));
-        self.draw_timing(c, ui, stats, Rect::new(400.0, 100.0, 384.0, 336.0));
+        let (lw, rx, rw) = self.columns(376.0, 400.0);
+        let h = 336.0 + self.extra().1;
+        self.draw_tempo(c, ui, stats, Rect::new(16.0, 100.0, lw, h));
+        self.draw_timing(c, ui, stats, Rect::new(rx, 100.0, rw, h));
     }
 
     fn draw_tempo(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats, p: Rect) {
@@ -219,10 +221,13 @@ impl Editor {
     // ---- Kit ----
 
     pub(super) fn draw_kit_stats(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats) {
-        self.draw_dynamics(c, ui, stats, Rect::new(16.0, 100.0, 470.0, 336.0));
-        self.draw_speed(c, ui, stats, Rect::new(500.0, 100.0, 284.0, 100.0));
-        self.draw_balance(c, ui, stats, Rect::new(500.0, 208.0, 284.0, 104.0));
-        self.draw_pedal(c, ui, stats, Rect::new(500.0, 320.0, 284.0, 116.0));
+        let (lw, rx, rw) = self.columns(470.0, 500.0);
+        let ey = self.extra().1;
+        let k = ey / 3.0;
+        self.draw_dynamics(c, ui, stats, Rect::new(16.0, 100.0, lw, 336.0 + ey));
+        self.draw_speed(c, ui, stats, Rect::new(rx, 100.0, rw, 100.0 + k));
+        self.draw_balance(c, ui, stats, Rect::new(rx, 208.0 + k, rw, 104.0 + k));
+        self.draw_pedal(c, ui, stats, Rect::new(rx, 320.0 + 2.0 * k, rw, 116.0 + k));
     }
 
     fn draw_dynamics(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats, p: Rect) {
@@ -386,10 +391,13 @@ impl Editor {
     // ---- Keys ----
 
     pub(super) fn draw_keys_stats(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats) {
-        self.draw_chords(c, ui, stats, Rect::new(16.0, 100.0, 376.0, 336.0));
-        self.draw_range(c, ui, stats, Rect::new(400.0, 100.0, 384.0, 92.0));
-        self.draw_intervals(c, ui, stats, Rect::new(400.0, 200.0, 384.0, 128.0));
-        self.draw_session_keys(c, ui, stats, Rect::new(400.0, 336.0, 384.0, 100.0));
+        let (lw, rx, rw) = self.columns(376.0, 400.0);
+        let ey = self.extra().1;
+        let k = ey / 3.0;
+        self.draw_chords(c, ui, stats, Rect::new(16.0, 100.0, lw, 336.0 + ey));
+        self.draw_range(c, ui, stats, Rect::new(rx, 100.0, rw, 92.0 + k));
+        self.draw_intervals(c, ui, stats, Rect::new(rx, 200.0 + k, rw, 128.0 + k));
+        self.draw_session_keys(c, ui, stats, Rect::new(rx, 336.0 + 2.0 * k, rw, 100.0 + k));
     }
 
     fn draw_chords(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, stats: &Stats, p: Rect) {
@@ -522,11 +530,13 @@ impl Editor {
             ));
         }
         parts.push((format!("{} days played in all", commas(history.days.len() as u64)), None));
-        self.parts_line(c, ui, 16.0, 106.0, WIDTH_F - 16.0, parts);
+        self.parts_line(c, ui, 16.0, 106.0, self.w() - 16.0, parts);
 
         self.draw_calendar(c, ui, &history, stats, today);
-        self.draw_week_hours(c, ui, stats, Rect::new(16.0, 250.0, 470.0, 186.0));
-        self.draw_bests(c, ui, &history, stats, Rect::new(500.0, 250.0, 284.0, 186.0));
+        let (lw, rx, rw) = self.columns(470.0, 500.0);
+        let h = 186.0 + self.extra().1;
+        self.draw_week_hours(c, ui, stats, Rect::new(16.0, 250.0, lw, h));
+        self.draw_bests(c, ui, &history, stats, Rect::new(rx, 250.0, rw, h));
     }
 
     /// A year of days, a column per week, darker for more notes. Click a day to see it.
@@ -579,7 +589,7 @@ impl Editor {
                     p.rounded_rect(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0, 3.0);
                     c.stroke_path(&p, &Paint::color(Color::rgba(255, 255, 255, 160)).with_line_width(1.0));
                 }
-                let value = if n == 0 { "Not played".to_string() } else { format!("{} notes", commas(n)) };
+                let value = if n == 0 { "Not played".to_string() } else { amount(ui, n) };
                 ui.tips.push((r, format!("{}\n{value}", day.format("%a %-d %b %Y"))));
                 ui.regions.push((r, Action::ShowDay((day - today).num_days() as i32)));
             }
@@ -633,7 +643,8 @@ impl Editor {
                 if r.contains(ui.mouse) && matches!(ui.overlay, Overlay::None) {
                     c.stroke_path(&path, &Paint::color(Color::rgba(255, 255, 255, 150)).with_line_width(1.0));
                 }
-                ui.tips.push((r, format!("{}s, {:02}:00–{:02}:00\n{} notes", weekday_name(d), h, (h + 1) % 24, commas(n))));
+                let value = amount(ui, n);
+                ui.tips.push((r, format!("{}s, {:02}:00–{:02}:00\n{value}", weekday_name(d), h, (h + 1) % 24)));
             }
         }
         for h in (0..24).step_by(3) {
@@ -651,29 +662,33 @@ impl Editor {
                 let when = Local.timestamp_opt(longest.start * 60, 0).single().map(|t| t.format("%a %-d %b").to_string()).unwrap_or_default();
                 self.text(c, p.x + 14.0, p.y + 62.0, &format!("Longest {}  ({when})", theme::duration((longest.end - longest.start) as f64)), 12.5, theme::dim(), Align::Left);
             }
-            ui.tips.push((Rect::new(p.x, p.y + 30.0, p.w, 44.0), format!("In this range\na session ends after {} minutes without a note", stats::SESSION_GAP)));
+            let without = if ui.kit.is_audio() { "playing" } else { "a note" };
+            ui.tips.push((Rect::new(p.x, p.y + 30.0, p.w, 44.0), format!("In this range\na session ends after {} minutes without {without}", stats::SESSION_GAP)));
         } else {
             self.text(c, p.x + 14.0, p.y + 42.0, "None in this range", 12.5, theme::dim(), Align::Left);
         }
 
         self.label(c, p.x + 14.0, p.y + 92.0, "Personal bests", theme::dim(), Align::Left);
-        // (what, (notes, short date, full date))
+        // (what, (amount, short date, full date)). An audio profile's busiest minute is just a
+        // full one, so it has no best minute.
         type Best = Option<(String, String, String)>;
+        let audio = ui.kit.is_audio();
         let rows: [(&str, Best); 3] = [
-            ("Minute", history.best_minute.map(|(m, n)| {
+            ("Minute", history.best_minute.filter(|_| !audio).map(|(m, n)| {
                 let date = Local.timestamp_opt(m * 60, 0).single().map(|t| t.format("%-d %b %Y").to_string()).unwrap_or_default();
-                (commas(n), date, minute_label(m))
+                (amount(ui, n), date, minute_label(m))
             })),
-            ("Day", history.best_day().map(|(d, n)| (commas(n), d.format("%-d %b %Y").to_string(), d.format("%A %-d %B %Y").to_string()))),
-            ("Week", history.best_week().map(|(d, n)| (commas(n), d.format("%-d %b %Y").to_string(), format!("the week of {}", d.format("%-d %B %Y"))))),
+            ("Day", history.best_day().map(|(d, n)| (amount(ui, n), d.format("%-d %b %Y").to_string(), d.format("%A %-d %B %Y").to_string()))),
+            ("Week", history.best_week().map(|(d, n)| (amount(ui, n), d.format("%-d %b %Y").to_string(), format!("the week of {}", d.format("%-d %B %Y"))))),
         ];
+        let rows: Vec<_> = rows.into_iter().filter(|(what, _)| !(audio && *what == "Minute")).collect();
         for (i, (what, best)) in rows.into_iter().enumerate() {
             let y = p.y + 116.0 + i as f32 * 22.0;
             self.text(c, p.x + 14.0, y, what, 12.5, theme::dim(), Align::Left);
             if let Some((value, short, full)) = best {
-                self.gradient_text(c, p.x + 80.0, y, &format!("{value} notes"), 14.0, 120.0, Align::Left);
+                self.gradient_text(c, p.x + 80.0, y, &value, 14.0, 120.0, Align::Left);
                 self.text(c, p.x + p.w - 14.0, y, &short, 11.0, theme::faint(), Align::Right);
-                ui.tips.push((Rect::new(p.x + 8.0, y - 11.0, p.w - 16.0, 22.0), format!("Best {}: {full}\n{value} notes", what.to_lowercase())));
+                ui.tips.push((Rect::new(p.x + 8.0, y - 11.0, p.w - 16.0, 22.0), format!("Best {}: {full}\n{value}", what.to_lowercase())));
             }
         }
     }
@@ -695,13 +710,13 @@ impl Editor {
         self.big(c, 16.0, 136.0, &title, "", 26.0);
         let _ = tw;
         if stats.total == 0 {
-            self.empty(c, Rect::new(16.0, 160.0, WIDTH_F - 32.0, 270.0), "Nothing played in this range", "Pick another one above.");
+            self.empty(c, Rect::new(16.0, 160.0, self.w() - 32.0, 270.0 + self.extra().1), "Nothing played in this range", "Pick another one above.");
             return;
         }
         let tiles = review_tiles(stats, ui);
         let (cols, gap) = (4usize, 8.0);
-        let tw = (WIDTH_F - 32.0 - gap * (cols as f32 - 1.0)) / cols as f32;
-        let th = 84.0;
+        let tw = (self.w() - 32.0 - gap * (cols as f32 - 1.0)) / cols as f32;
+        let th = 84.0 + self.extra().1 / 3.0;
         for (i, (label, value, sub)) in tiles.iter().take(12).enumerate() {
             let (col, row) = (i % cols, i / cols);
             let r = Rect::new(16.0 + col as f32 * (tw + gap), 162.0 + row as f32 * (th + 6.0), tw, th);
@@ -715,7 +730,6 @@ impl Editor {
     }
 }
 
-const WIDTH_F: f32 = theme::WIDTH as f32;
 
 /// The review's tiles: (label, value, detail), the ones with something to say.
 fn review_tiles(s: &Stats, ui: &Ui) -> Vec<(String, String, String)> {
@@ -795,4 +809,9 @@ fn review_tiles(s: &Stats, ui: &Ui) -> Vec<(String, String, String)> {
         add("Busiest minute", format!("{} notes", commas(n)), when);
     }
     t
+}
+
+/// An amount of a profile's unit: notes, or time for an audio profile (which logs seconds).
+fn amount(ui: &Ui, n: u64) -> String {
+    if ui.kit.is_audio() { super::seconds_text(n) } else { format!("{} notes", commas(n)) }
 }

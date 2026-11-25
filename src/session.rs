@@ -18,6 +18,12 @@
 //! [`Analyzer`](crate::analyze::Analyzer), whose results go into the same per-minute counts. It
 //! also compacts months that are over, and keeps the records the counter screen celebrates
 //! (streak, best day, best minute).
+//!
+//! An audio profile ([`Kind::Audio`](crate::kit::Kind)) counts time instead of notes: the audio
+//! thread watches the input's peak level ([`AudioGate`]) and pushes one `Hit` with velocity 0 for
+//! every second of playing. Playing is a signal above the profile's threshold, and goes on until
+//! [`AUDIO_HOLD`] of silence, so the counter keeps going through short pauses and stops after a
+//! longer one. Such a profile's log lines hold seconds where a MIDI profile's hold notes.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -26,15 +32,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::analyze::{self, AHit, Analyzer};
-use crate::kit::{self, Kit, Role};
+use crate::kit::{self, Kind, Kit, Role};
 use crate::store::{self, MinuteCounts, Month, Store};
 
 pub const AUTOSAVE: Duration = Duration::from_secs(30);
 const DRAIN_EVERY: Duration = Duration::from_secs(2);
 const RING_CAPACITY: usize = 4096;
-/// The editor's size limits, relative to 800 × 450 (times the host's content scale).
+/// The editor's size limits, per side, relative to 800 × 450 (times the host's content scale).
+/// Within them any shape goes.
 pub const MIN_ZOOM: f32 = 0.75;
 pub const MAX_ZOOM: f32 = 3.0;
+/// The editor's default size (at a content scale of 1).
+pub const EDITOR_SIZE: (f32, f32) = (800.0, 450.0);
 /// How many recent hits the monitor keeps.
 pub const RECENT: usize = 10;
 /// How often months that are over get compacted.
@@ -43,6 +52,8 @@ const COMPACT_EVERY: Duration = Duration::from_secs(6 * 3600);
 pub const NO_PEDAL: u8 = 255;
 /// History needed (days played) before a best day or minute is celebrated.
 const RECORD_MIN_DAYS: u32 = 7;
+/// Audio profiles: how long a silence lasts before playing stops.
+pub const AUDIO_HOLD: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Hit {
@@ -91,6 +102,30 @@ impl Guard {
         self.epoch = epoch;
         self.pedal = pedal;
     }
+}
+
+/// Audio-thread state of an audio profile: when the playing stops unless more signal arrives, and
+/// the samples of playing not yet pushed as a whole second (both on the sample clock).
+#[derive(Default)]
+pub struct AudioGate {
+    held_until: u64,
+    frac: u64,
+}
+
+impl AudioGate {
+    pub fn reset(&mut self) {
+        *self = AudioGate::default();
+    }
+}
+
+/// The peak level of some samples. A plain loop the compiler vectorises: a fraction of a
+/// microsecond for a block of 512 samples.
+pub fn peak32(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, &x| m.max(x.abs()))
+}
+
+pub fn peak64(samples: &[f64]) -> f32 {
+    samples.iter().fold(0.0f64, |m, &x| m.max(x.abs())) as f32
 }
 
 /// A note-on as the monitor shows it.
@@ -196,6 +231,14 @@ pub fn milestones() -> impl Iterator<Item = u64> {
     }))
 }
 
+/// Audio profiles' milestones, in seconds: 1, 10, 25, 50, 100, 250, 500 hours and so on.
+pub fn audio_milestones() -> impl Iterator<Item = u64> {
+    [1u64, 10].into_iter().chain((0..8).flat_map(|e| {
+        let p = 10u64.pow(e);
+        [25 * p, 50 * p, 100 * p]
+    })).map(|h| h * 3600)
+}
+
 /// Something worth celebrating today, newest kind first.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cheer {
@@ -209,6 +252,10 @@ pub enum Cheer {
 
 pub struct Snapshot {
     pub profile: String,
+    /// Audio profiles count seconds of playing; MIDI profiles count notes.
+    pub audio: bool,
+    /// Audio profiles: signal is coming in (or stopped less than [`AUDIO_HOLD`] ago).
+    pub playing: bool,
     pub total: u64,
     pub today: u64,
     /// Days in a row played, counting today if played.
@@ -231,10 +278,15 @@ pub struct Shared {
     /// how many were ever written.
     recent: [AtomicU64; RECENT],
     recent_seq: AtomicU32,
-    /// The editor's size relative to its default (f32 bits), kept with the instance's state.
-    zoom: AtomicU32,
+    /// The editor's size at a content scale of 1 (two f32s' bits), kept with the instance's state.
+    size: AtomicU64,
     /// The current profile's hi-hat pedal CC (0 = not read), for the plugin's MIDI mapping.
     pedal_cc: AtomicU8,
+    /// The current profile is an audio profile, its threshold (linear peak, f32 bits), and
+    /// whether it's playing right now (set by the audio thread).
+    audio: AtomicBool,
+    threshold: AtomicU32,
+    playing: AtomicBool,
     /// Called (on the UI thread) when the pedal CC setting changes, so the plugin can tell the host.
     on_pedal_cc: Mutex<Option<Box<dyn Fn() + Send>>>,
     profile: Mutex<Profile>,
@@ -274,8 +326,11 @@ impl Shared {
             retrigger_ms: AtomicU32::new(kit::DEFAULT_RETRIGGER_MS),
             recent: std::array::from_fn(|_| AtomicU64::new(0)),
             recent_seq: AtomicU32::new(0),
-            zoom: AtomicU32::new(1.0f32.to_bits()),
+            size: AtomicU64::new(pack_size(EDITOR_SIZE)),
             pedal_cc: AtomicU8::new(0),
+            audio: AtomicBool::new(false),
+            threshold: AtomicU32::new(Kit::default().threshold().to_bits()),
+            playing: AtomicBool::new(false),
             on_pedal_cc: Mutex::new(None),
             profile: Mutex::new(Profile::empty(String::new())),
             generation: AtomicU64::new(0),
@@ -333,6 +388,50 @@ impl Shared {
         counted
     }
 
+    /// Whether the current profile tracks audio. Real-time safe.
+    #[inline]
+    pub fn is_audio(&self) -> bool {
+        self.audio.load(Ordering::Relaxed)
+    }
+
+    /// An audio block of `n` samples starting at `clock`, whose input peaked at `peak`: playing
+    /// starts with a signal over the threshold and stops after [`AUDIO_HOLD`] without one, and every
+    /// whole second of playing goes into the ring. Real-time safe.
+    pub fn audio_block(&self, gate: &mut AudioGate, clock: u64, n: u64, rate: f64, peak: f32) {
+        let rate = if rate > 0.0 { rate } else { 48000.0 };
+        let end = clock + n;
+        if peak > f32::from_bits(self.threshold.load(Ordering::Relaxed)) {
+            gate.held_until = end + (AUDIO_HOLD.as_secs_f64() * rate) as u64;
+        }
+        gate.frac += gate.held_until.saturating_sub(clock).min(n);
+        let second = rate.round() as u64;
+        if gate.frac >= second {
+            let minute = store::now_minute() as u32;
+            while gate.frac >= second {
+                gate.frac -= second;
+                self.record_second(minute);
+            }
+        }
+        let playing = gate.held_until > end;
+        if playing != self.playing.load(Ordering::Relaxed) {
+            self.playing.store(playing, Ordering::Relaxed);
+            // Not a hit, but it wakes the window to show it.
+            self.hits_seen.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The audio stopped coming (the host stopped processing): not playing any more.
+    pub fn stop_playing(&self) {
+        if self.playing.swap(false, Ordering::Relaxed) {
+            self.hits_seen.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Records a second of audio playing (for tests and tools, and from [`Self::audio_block`]).
+    pub fn record_second(&self, minute: u32) {
+        self.push_hit(Hit { micros: 0, minute, host_bpm_x10: 0, note: 0, vel: 0, pedal: NO_PEDAL, epoch: 0 });
+    }
+
     /// Records a note-on without timing (for tests and tools).
     pub fn record_hit(&self, minute: u32, note: u8, vel: u8) {
         self.push_hit(Hit { micros: 0, minute, host_bpm_x10: 0, note, vel, pedal: NO_PEDAL, epoch: 0 });
@@ -379,14 +478,28 @@ impl Shared {
         out
     }
 
-    pub fn zoom(&self) -> f32 {
-        f32::from_bits(self.zoom.load(Ordering::Relaxed))
+    /// The editor's size at a content scale of 1.
+    pub fn editor_size(&self) -> (f32, f32) {
+        let v = self.size.load(Ordering::Relaxed);
+        (f32::from_bits((v >> 32) as u32), f32::from_bits(v as u32))
     }
 
-    pub fn set_zoom(&self, zoom: f32) {
-        if zoom.is_finite() {
-            self.zoom.store(zoom.clamp(MIN_ZOOM, MAX_ZOOM).to_bits(), Ordering::Relaxed);
+    /// Sets the editor's size (at a content scale of 1), each side within limits.
+    pub fn set_editor_size(&self, w: f32, h: f32) {
+        if w.is_finite() && h.is_finite() {
+            self.size.store(pack_size(clamp_size(w, h)), Ordering::Relaxed);
         }
+    }
+
+    /// How much the 800 × 450 layout is scaled to fit the editor.
+    pub fn zoom(&self) -> f32 {
+        let (w, h) = self.editor_size();
+        (w / EDITOR_SIZE.0).min(h / EDITOR_SIZE.1)
+    }
+
+    /// Sets a 16:9 size, `zoom` times the default.
+    pub fn set_zoom(&self, zoom: f32) {
+        self.set_editor_size(EDITOR_SIZE.0 * zoom, EDITOR_SIZE.1 * zoom);
     }
 
     fn apply_kit(&self, kit: &Kit) {
@@ -395,6 +508,10 @@ impl Shared {
         }
         self.retrigger_ms.store(kit.retrigger_ms, Ordering::Relaxed);
         self.pedal_cc.store(kit.pedal_cc, Ordering::Relaxed);
+        self.threshold.store(kit.threshold().to_bits(), Ordering::Relaxed);
+        if self.audio.swap(kit.is_audio(), Ordering::Relaxed) != kit.is_audio() {
+            self.playing.store(false, Ordering::Relaxed);
+        }
     }
 
     /// The MIDI CC of the hi-hat pedal (0 = not read).
@@ -461,9 +578,20 @@ impl Shared {
     fn drain_into(&self, p: &mut Profile) {
         let mut consumer = self.consumer.lock().unwrap();
         let drums = p.kit.is_drums();
+        let audio = p.kit.is_audio();
         let groups = self.groups.each_ref().map(|g| g.load(Ordering::Relaxed) & 127);
         while let Ok(hit) = consumer.pop() {
             let minute = hit.minute as i64;
+            // A second of audio has velocity 0, a note never does. Either can still be in the ring
+            // just after switching between kinds of profile; they're dropped.
+            if (hit.vel == 0) != audio {
+                continue;
+            }
+            if audio {
+                p.pending.entry(minute).or_default().total += 1;
+                p.pending_total += 1;
+                continue;
+            }
             let c = p.pending.entry(minute).or_default();
             c.add_hit(hit.note, hit.vel);
             let d = &mut c.detail;
@@ -520,22 +648,23 @@ impl Shared {
         let today_total = p.saved_today + today_pending;
         let records = p.records.as_ref().filter(|r| r.day == today);
         let streak = records.map(|r| r.streak).unwrap_or(0) + (today_total > 0) as u32;
-        let cheer = milestones()
-            .take_while(|&m| m <= total)
-            .last()
-            .filter(|&m| total - today_total < m)
+        let audio = p.kit.is_audio();
+        let passed = |list: &mut dyn Iterator<Item = u64>| list.take_while(|&m| m <= total).last().filter(|&m| total - today_total < m);
+        let milestone = if audio { passed(&mut audio_milestones()) } else { passed(&mut milestones()) };
+        let cheer = milestone
             .map(Cheer::Milestone)
             .or_else(|| {
                 let r = records.filter(|r| r.days_played >= RECORD_MIN_DAYS)?;
                 if today_total > r.best_day {
                     Some(Cheer::BestDay)
-                } else if peak > r.best_minute {
+                } else if !audio && peak > r.best_minute {
                     Some(Cheer::BestMinute(peak))
                 } else {
                     None
                 }
             });
-        Snapshot { profile: p.name.clone(), total, today: today_total, streak, cheer }
+        let playing = audio && self.playing.load(Ordering::Relaxed);
+        Snapshot { profile: p.name.clone(), audio, playing, total, today: today_total, streak, cheer }
     }
 
     pub fn profile_name(&self) -> String {
@@ -619,8 +748,20 @@ impl Shared {
         self.wake.notify_all();
     }
 
+    /// Creates a profile (a MIDI one, see [`Self::create_profile_of`]) and switches to it.
     pub fn create_profile(&self, name: &str) -> Result<String, String> {
+        self.create_profile_of(name, Kind::Midi)
+    }
+
+    /// Creates a profile of a kind and switches to it. A profile that already exists keeps its
+    /// kind.
+    pub fn create_profile_of(&self, name: &str, kind: Kind) -> Result<String, String> {
+        let existed = store::clean_profile_name(name).is_ok_and(|n| self.store.profile_dir(&n).is_dir());
         let name = self.store.create_profile(name)?;
+        if !existed && kind == Kind::Audio {
+            let kit = Kit { kind, ..Kit::default() };
+            kit.save(&self.store.profile_dir(&name)).map_err(|e| e.to_string())?;
+        }
         self.select_profile(&name);
         Ok(name)
     }
@@ -845,6 +986,15 @@ impl Profile {
             self.today_minutes.clear();
         }
     }
+}
+
+fn pack_size((w, h): (f32, f32)) -> u64 {
+    (w.to_bits() as u64) << 32 | h.to_bits() as u64
+}
+
+/// Keeps each side of an editor size (at a content scale of 1) within limits.
+pub fn clamp_size(w: f32, h: f32) -> (f32, f32) {
+    (w.clamp(EDITOR_SIZE.0 * MIN_ZOOM, EDITOR_SIZE.0 * MAX_ZOOM), h.clamp(EDITOR_SIZE.1 * MIN_ZOOM, EDITOR_SIZE.1 * MAX_ZOOM))
 }
 
 fn settings_mtime(profile_dir: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -1081,5 +1231,62 @@ mod tests {
         let s = Shared::new(store.clone());
         assert_eq!(s.snapshot().total, 4);
         let _ = std::fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn audio_profiles_count_seconds() {
+        let store = temp_store("audio");
+        let s = Shared::new(store.clone());
+        s.create_profile_of("Bass", Kind::Audio).unwrap();
+        assert!(s.is_audio() && s.kit().is_audio());
+        let mut g = AudioGate::default();
+        let rate = 1000.0;
+        let mut clock = 0;
+        let mut block = |s: &Shared, peak: f32, blocks: usize| {
+            for _ in 0..blocks {
+                s.audio_block(&mut g, clock, 100, rate, peak);
+                clock += 100;
+            }
+        };
+        // 2 s of signal, then a pause shorter than the hold: it all counts.
+        block(&s, 0.5, 20);
+        assert!(s.snapshot().playing);
+        block(&s, 0.0, 30);
+        block(&s, 0.2, 10);
+        assert_eq!(s.snapshot().total, 6);
+        // Then a long silence: 4 s more, and the counter stops.
+        block(&s, 0.0, 100);
+        let snap = s.snapshot();
+        assert_eq!(snap.total, 10);
+        assert!(snap.audio && !snap.playing);
+        // Below the threshold (-50 dBFS) is silence.
+        block(&s, 0.001, 50);
+        assert_eq!(s.snapshot().total, 10);
+        // Notes don't count on an audio profile.
+        s.record_hit(store::now_minute() as u32, 60, 100);
+        assert_eq!(s.snapshot().total, 10);
+        s.shutdown();
+
+        // Saved as seconds, and the kind sticks with the profile.
+        let s = Shared::new(store.clone());
+        s.select_profile("Bass");
+        assert!(s.is_audio());
+        assert_eq!(s.snapshot().total, 10);
+        assert_eq!(s.snapshot().today, 10);
+        // Creating it again doesn't change its kind; MIDI profiles still count notes.
+        s.create_profile_of("Bass", Kind::Midi).unwrap();
+        assert!(s.is_audio());
+        s.create_profile("Keys").unwrap();
+        assert!(!s.is_audio());
+        s.record_second(store::now_minute() as u32);
+        s.record_hit(store::now_minute() as u32, 60, 100);
+        assert_eq!(s.snapshot().total, 1);
+        let _ = std::fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn audio_milestones_are_hours() {
+        let m: Vec<u64> = audio_milestones().take(6).map(|s| s / 3600).collect();
+        assert_eq!(m, vec![1, 10, 25, 50, 100, 250]);
     }
 }

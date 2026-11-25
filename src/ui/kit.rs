@@ -7,7 +7,7 @@
 use femtovg::renderer::OpenGl;
 use femtovg::{Align, Baseline, Canvas, Color, Paint, Path};
 
-use super::theme::{self, WithAlpha, HEIGHT, WIDTH};
+use super::theme::{self, WithAlpha};
 use super::{Action, Editor, Overlay, Rect, Ui};
 use crate::kit;
 use crate::stats;
@@ -58,13 +58,15 @@ impl Editor {
     }
 
     pub(super) fn draw_kit(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
-        let w = WIDTH as f32;
+        let w = self.w();
         self.top_bar(c, ui);
         self.label(c, w - 16.0, 28.0, "Drums", theme::faint(), Align::Right);
         Self::hline(c, 16.0, w - 16.0, 52.0, theme::hairline());
 
         // The drum map.
-        let panel = Rect::new(16.0, 64.0, 470.0, 370.0);
+        let (lw, rx, rw) = self.columns(470.0, 500.0);
+        let ey = self.extra().1;
+        let panel = Rect::new(16.0, 64.0, lw, 370.0 + ey);
         Self::rounded(c, panel, 6.0, Some(theme::panel_fill()), Some(Paint::color(theme::hairline())));
         self.label(c, panel.x + 14.0, panel.y + 20.0, "Drum map", theme::dim(), Align::Left);
         let learn = Rect::new(panel.x + panel.w - 92.0, panel.y + 6.0, 80.0, 28.0);
@@ -111,9 +113,9 @@ impl Editor {
             self.text(c, panel.x + panel.w - 14.0, panel.y + panel.h - 13.0, &shown, 11.0, theme::faint(), Align::Right);
         }
 
-        self.draw_recent(c, ui, Rect::new(500.0, 64.0, w - 516.0, 232.0));
-        self.draw_guard(c, ui, Rect::new(500.0, 304.0, w - 516.0, 68.0));
-        self.draw_pedal_setting(c, ui, Rect::new(500.0, 380.0, w - 516.0, 54.0));
+        self.draw_recent(c, ui, Rect::new(rx, 64.0, rw, 232.0 + ey));
+        self.draw_guard(c, ui, Rect::new(rx, 304.0 + ey, rw, 68.0));
+        self.draw_pedal_setting(c, ui, Rect::new(rx, 380.0 + ey, rw, 54.0));
     }
 
     /// Whether to read the hi-hat pedal (CC 4), for how open the hats are played.
@@ -233,8 +235,8 @@ impl Editor {
     }
 
     pub(super) fn draw_learn(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
-        let (w, h) = (WIDTH as f32, HEIGHT as f32);
-        Self::scrim(c, ui);
+        let (w, h) = (self.w(), self.h());
+        self.scrim(c, ui);
         let panel = Rect::new(w / 2.0 - 190.0, h / 2.0 - 85.0, 380.0, 170.0);
         Self::rounded(c, panel, 8.0, Some(theme::popup_fill()), Some(theme::window_gradient(140)));
         self.label(c, panel.x + 24.0, panel.y + 30.0, "Learn", theme::dim(), Align::Left);
@@ -247,8 +249,8 @@ impl Editor {
     }
 
     pub(super) fn draw_name_drum(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui, note: u8, text: &str, error: Option<&str>) {
-        let (w, h) = (WIDTH as f32, HEIGHT as f32);
-        Self::scrim(c, ui);
+        let (w, h) = (self.w(), self.h());
+        self.scrim(c, ui);
         let panel = Rect::new(w / 2.0 - 260.0, h / 2.0 - 165.0, 520.0, 330.0);
         Self::rounded(c, panel, 8.0, Some(theme::popup_fill()), Some(theme::window_gradient(140)));
         self.label(c, panel.x + 24.0, panel.y + 28.0, "Name this drum", theme::dim(), Align::Left);
@@ -311,8 +313,8 @@ impl Editor {
     }
 
     /// Darkens the window behind a dialog and swallows clicks outside it.
-    pub(super) fn scrim(c: &mut Canvas<OpenGl>, ui: &mut Ui) {
-        let (w, h) = (WIDTH as f32, HEIGHT as f32);
+    pub(super) fn scrim(&self, c: &mut Canvas<OpenGl>, ui: &mut Ui) {
+        let (w, h) = (self.w(), self.h());
         let mut p = Path::new();
         p.rect(0.0, 0.0, w, h);
         c.fill_path(&p, &Paint::color(Color::rgba(0, 0, 0, 150)));

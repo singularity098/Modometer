@@ -90,13 +90,43 @@ record new decisions here.
   fills, per-drum dynamics and timing); any other profile gets the keys analysis (chords,
   intervals).
 
+## Owner's requests and decisions (2026-11-25, audio profiles and free resizing)
+
+- **Audio profiles** (owner): a second profile type that records the time played each day from an
+  audio signal instead of MIDI. Playing is a signal passing through; silence doesn't count. The
+  owner asked for the silence detection only if its CPU cost is truly negligible: it's one peak
+  scan of the input per block, measured at about 450 ns for a 512-sample stereo block (0.004 % of a
+  core at 48 kHz), and MIDI profiles skip it entirely.
+- **The counter** of an audio profile is a clock (hours:minutes:seconds) that goes up by the second
+  while playing. When playing stops for **4 seconds** it stops until playing resumes. Decision:
+  those 4 seconds count (the clock showed them, and it never jumps back), and so do pauses shorter
+  than that. "Playing" is a peak above **-50 dBFS** (`audio-threshold-db` in `settings.txt`, no UI
+  for now).
+- **Two profile types**, MIDI or audio, chosen when the profile is created (New profile dialog).
+  `type audio` in `settings.txt` marks an audio profile; without it a profile is MIDI, so existing
+  profiles and files work exactly as before. A profile's type isn't changed afterwards (its log's
+  unit would change); make a new profile instead.
+- **Storage**: an audio profile uses the same month logs, with seconds of playing as the line's total
+  and no other fields (`2026-11-05T15:04Z 42`), so totals, today, streaks, compaction and the cache
+  work unchanged.
+- **What applies to audio profiles**: the counter (no Drums button), today's time, the streak, best
+  day and milestones in hours (1, 10, 25, 50, 100, 250, 500, 1,000 h, ...). Stats: Overview (the
+  timeline in time, time played, sessions, average per bucket) and Habits (calendar, when you play,
+  sessions, best day and week). No best minute (a full minute is 60 s), and no rhythm, kit, keys or
+  review pages.
+- **Free resizing** (owner): the editor is no longer held to 16:9. Any size goes, each side between
+  0.75× and 3× of 800 × 450. The layout is scaled so 800 × 450 fits and stretches to fill the rest:
+  extra width is shared between the two columns, extra height goes to the timeline and the lower
+  panels, and the counter stays centred.
+
 ## Design
 
 ### Plugin
 - One VST3 class is both processor and controller. Stereo audio in/out, copied through untouched;
   one MIDI input bus; no MIDI output bus, so the host passes MIDI on unchanged (CCs, pitch bend and
   all, which re-emitting VST3 events couldn't do faithfully).
-- No parameters. The plugin state is just the profile name.
+- One read-only parameter (the hi-hat pedal). The plugin state is the profile name and the editor
+  size.
 - A note-on with velocity > 0 counts as one hit, unless the retrigger guard drops it. Note-on with
   velocity 0 is a note-off.
 - Retrigger guard: on the audio thread, per drum (a note, or all notes sharing a name), compared in
@@ -104,6 +134,11 @@ record new decisions here.
   the window are atomics the UI thread updates; no locks on the audio thread.
 - Every note-on, counted or not, also goes into a 10-slot lock-free list of recent hits (packed in
   one `AtomicU64` each) for the Drums view's monitor and for Learn.
+- Audio profiles: instead of reading MIDI, the audio thread takes the input's peak each block
+  (skipping channels the host flags silent). Above the threshold, playing goes on until 4 s after
+  the block; the block's samples within that hold add up, and each whole second goes into the ring
+  as a hit with velocity 0 (a note never has velocity 0), which the saver adds to the minute's
+  total. A "playing" flag (atomic) drives the counter's dot; it clears when processing stops.
 - The audio thread pushes each counted hit into a lock-free ring buffer: minute, note, velocity,
   its time on the instance's sample clock (µs), the host's tempo while the transport plays, the
   hi-hat pedal's position (if read) and a clock epoch (24 bytes). No allocation, locks or I/O on the
@@ -204,15 +239,13 @@ when the plugin is unloaded. Worst case on a crash: 30 s of notes.
 Times are stored in UTC and shown in local time, so DST changes and travel stay correct.
 
 ### UI
-- baseview + femtovg (OpenGL). Laid out at 800 × 450 and scaled to the window: the view is
-  resizable (owner, 2026-11-05). `checkSizeConstraint` keeps the 16:9 shape between 0.75× and 3×
-  (times the host's content scale), following the side the user dragged, or, when both sides change
-  (a corner, or a host such as Carlita fitting the editor into its space), the largest 16:9 size
-  inside the proposed one (2026-11-17: a larger answer was cut off, and Carlita flipped between the
-  two sizes); `onSize` resizes the
-  window to whatever the host gives, and the layout is centred with even margins if the shape
-  differs. The zoom is saved in the instance's state (`zoom 1.500` after the profile name; older
-  versions ignore it).
+- baseview + femtovg (OpenGL). Designed at 800 × 450, scaled so that fits the window, and stretched
+  to fill the window's shape (2026-11-25; until then it kept 16:9 with margins). The view is
+  resizable (owner, 2026-11-05): `checkSizeConstraint` only keeps each side between 0.75× and 3× of
+  800 × 450 (times the host's content scale), so a host fitting the editor into a space gets exactly
+  that space; `onSize` resizes the window to whatever the host gives. The size is saved in the
+  instance's state after the profile name: `zoom 1.500` for a 16:9 size (older versions read only
+  this), plus `size 1000 600` (at a content scale of 1) for any other shape, which wins.
 - Mouse cursor: set explicitly when the window opens (on X11 a window without its own cursor shows
   its parent's, so it kept e.g. the host's resize arrow when entered from the side). A hand over
   anything clickable, an I-beam over text fields, the arrow elsewhere.

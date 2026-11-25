@@ -3,9 +3,10 @@
 
 //! The VST3 editor view: embeds the baseview window into the host's X11 window.
 //!
-//! The view is resizable: the host asks [`checkSizeConstraint`](IPlugViewTrait::checkSizeConstraint)
-//! while the user drags its window's edge (we keep the 16:9 shape, 0.75× to 3×), then calls
-//! `onSize`, and the editor scales its drawing to fit. The size is kept in the instance's state.
+//! The view is resizable to any shape: the host asks
+//! [`checkSizeConstraint`](IPlugViewTrait::checkSizeConstraint) while the user drags its window's
+//! edge (we only keep each side between 0.75× and 3× of 800 × 450), then calls `onSize`, and the
+//! editor scales and stretches its layout to fill it. The size is kept in the instance's state.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CStr};
@@ -16,8 +17,8 @@ use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHan
 use vst3::Class;
 use vst3::Steinberg::*;
 
-use crate::session::{Shared, MAX_ZOOM, MIN_ZOOM};
-use crate::ui::{self, theme, Editor, Options};
+use crate::session::{self, Shared};
+use crate::ui::{self, Editor, Options};
 
 pub struct View {
     shared: Arc<Shared>,
@@ -38,33 +39,20 @@ impl View {
         View { shared, window: RefCell::new(None), scale: Cell::new(1.0) }
     }
 
-    /// The size for a zoom, in physical pixels.
-    fn size_at(&self, zoom: f32) -> (i32, i32) {
-        let s = self.scale.get() * zoom;
-        ((theme::WIDTH as f32 * s).round() as i32, (theme::HEIGHT as f32 * s).round() as i32)
+    /// A size at a content scale of 1 in physical pixels.
+    fn physical(&self, (w, h): (f32, f32)) -> (i32, i32) {
+        let s = self.scale.get();
+        ((w * s).round() as i32, (h * s).round() as i32)
     }
 
     fn size(&self) -> (i32, i32) {
-        self.size_at(self.shared.zoom())
+        self.physical(self.shared.editor_size())
     }
 
-    /// The zoom a host-proposed size asks for, within limits. When only one side changed (the user
-    /// drags one edge of the window), that side decides. When both did (a corner, or a host fitting
-    /// the editor into a space, as Carlita does), the largest size inside the proposed one: a larger
-    /// answer is cut off, and a host that then fits the editor again flips between the two sizes.
-    fn zoom_for(&self, w: i32, h: i32) -> f32 {
+    /// A size in physical pixels at a content scale of 1.
+    fn unscaled(&self, w: i32, h: i32) -> (f32, f32) {
         let s = self.scale.get();
-        let (cw, ch) = self.size();
-        let zw = w as f32 / (theme::WIDTH as f32 * s);
-        let zh = h as f32 / (theme::HEIGHT as f32 * s);
-        let z = if h == ch {
-            zw
-        } else if w == cw {
-            zh
-        } else {
-            zw.min(zh)
-        };
-        z.clamp(MIN_ZOOM, MAX_ZOOM)
+        (w as f32 / s, h as f32 / s)
     }
 }
 
@@ -95,7 +83,8 @@ impl IPlugViewTrait for View {
             return kResultFalse;
         }
         let parent = Parent(parent as usize as u64);
-        for settings in ui::window_settings((self.scale.get() * self.shared.zoom()) as f64) {
+        let (w, h) = self.size();
+        for settings in ui::window_settings(w.max(1) as u32, h.max(1) as u32) {
             let settings = settings.with_parent(&parent);
             let shared = Arc::clone(&self.shared);
             if let Ok(window) = baseview::Window::create(settings, move |ctx| Editor::new(ctx, shared, Options::default())) {
@@ -134,11 +123,9 @@ impl IPlugViewTrait for View {
     unsafe fn onSize(&self, new_size: *mut ViewRect) -> tresult {
         let Some(r) = new_size.as_ref() else { return kInvalidArgument };
         let (w, h) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
-        // Take whatever the host gives (the editor centres itself in a size of another shape), and
-        // remember the zoom that fits it.
-        let s = self.scale.get();
-        let fits = (w as f32 / (theme::WIDTH as f32 * s)).min(h as f32 / (theme::HEIGHT as f32 * s));
-        self.shared.set_zoom(fits);
+        // Take whatever the host gives (the editor fills any shape), and remember it.
+        let (uw, uh) = self.unscaled(w, h);
+        self.shared.set_editor_size(uw, uh);
         if let Some(window) = self.window.borrow().as_ref() {
             let _ = window.resize(baseview::dpi::PhysicalSize::new(w as u32, h as u32));
         }
@@ -159,7 +146,8 @@ impl IPlugViewTrait for View {
 
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
         let Some(rect) = rect.as_mut() else { return kInvalidArgument };
-        let (w, h) = self.size_at(self.zoom_for(rect.right - rect.left, rect.bottom - rect.top));
+        let (uw, uh) = self.unscaled(rect.right - rect.left, rect.bottom - rect.top);
+        let (w, h) = self.physical(session::clamp_size(uw, uh));
         rect.right = rect.left + w;
         rect.bottom = rect.top + h;
         kResultOk

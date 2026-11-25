@@ -12,6 +12,8 @@
 //!                                                        # tempo or timing
 //! cargo run --example preview -- --profile Drums    # start on the drum kit profile
 //! cargo run --example preview -- --kit              # drums view
+//! cargo run --example preview -- --profile Bass     # an audio profile (time played)
+//! cargo run --example preview -- --size 1200x500    # a window of another size or shape
 //! cargo run --example preview -- --screenshot a.png # save the first frame and exit
 //! ```
 //! Data goes to a temporary folder unless MODOMETER_DATA_DIR is set.
@@ -19,7 +21,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use modometer::session::Shared;
+use modometer::kit::{Kind, Kit};
+use modometer::session::{AudioGate, Shared};
 use modometer::store::{self, MinuteCounts, Store};
 use modometer::ui::{self, Editor, Options};
 
@@ -60,6 +63,15 @@ fn fake_days(store: &Store, profile: &str, seed: u64, mut minute: impl FnMut(&mu
         }
     }
     store.append(profile, &minutes).unwrap();
+}
+
+/// An audio profile: seconds of playing per minute.
+fn fake_audio(store: &Store) {
+    if Kit::load(&store.profile_dir("Bass")).is_audio() && !store.months("Bass").is_empty() {
+        return;
+    }
+    Kit { kind: Kind::Audio, ..Kit::default() }.save(&store.profile_dir("Bass")).unwrap();
+    fake_days(store, "Bass", 0x9E3779B9, |r, _, c| c.total = (25 + r.below(36)) as u32);
 }
 
 /// An E minor pentatonic keys player, with chords.
@@ -159,6 +171,7 @@ fn main() {
     store.create_profile("Default").unwrap();
     fake_keys(&store);
     fake_drums(&store);
+    fake_audio(&store);
     // "Milestone": 990 notes yesterday and 20 today, so today passed 1,000.
     if store.create_profile("Milestone").is_ok() && store.months("Milestone").is_empty() {
         let mut minutes = BTreeMap::new();
@@ -180,27 +193,44 @@ fn main() {
     shared.select_profile(&arg("--profile").unwrap_or_else(|| if start_in_kit { "Drums".into() } else { "Default".into() }));
     shared.start();
 
-    // Pretend someone's playing: a little groove, with the odd double trigger.
+    // Pretend someone's playing: a little groove, with the odd double trigger (or on an audio
+    // profile, a signal now and then).
     let player = Arc::clone(&shared);
-    std::thread::spawn(move || {
-        let mut guard = modometer::session::Guard::default();
-        let start = std::time::Instant::now();
-        let pattern = [36u8, 42, 38, 42, 36, 36, 38, 49];
-        for i in 0.. {
-            // A quick burst first, so a screenshot of the drums view has hits in it.
-            std::thread::sleep(std::time::Duration::from_millis(if i < 8 { 5 } else { 180 }));
-            let note = pattern[i % pattern.len()];
-            let at = start.elapsed().as_micros() as u64 * 48 / 1000;
-            let minute = store::now_minute() as u32;
-            player.note_on(&mut guard, at, 48000.0, minute, note, 70 + (i % 5) as u8 * 10);
-            if i % 3 == 0 {
-                player.note_on(&mut guard, at + 48 * 9, 48000.0, minute, note, 20);
+    if shared.is_audio() {
+        std::thread::spawn(move || {
+            let mut gate = AudioGate::default();
+            let mut clock = 0;
+            for i in 0u64.. {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let peak = if (i / 300) % 4 == 3 { 0.0 } else { 0.3 };
+                player.audio_block(&mut gate, clock, 480, 48000.0, peak);
+                clock += 480;
             }
-        }
-    });
+        });
+    } else {
+        std::thread::spawn(move || {
+            let mut guard = modometer::session::Guard::default();
+            let start = std::time::Instant::now();
+            let pattern = [36u8, 42, 38, 42, 36, 36, 38, 49];
+            for i in 0.. {
+                // A quick burst first, so a screenshot of the drums view has hits in it.
+                std::thread::sleep(std::time::Duration::from_millis(if i < 8 { 5 } else { 180 }));
+                let note = pattern[i % pattern.len()];
+                let at = start.elapsed().as_micros() as u64 * 48 / 1000;
+                let minute = store::now_minute() as u32;
+                player.note_on(&mut guard, at, 48000.0, minute, note, 70 + (i % 5) as u8 * 10);
+                if i % 3 == 0 {
+                    player.note_on(&mut guard, at + 48 * 9, 48000.0, minute, note, 20);
+                }
+            }
+        });
+    }
 
     let options = Options { screenshot, start_in_stats, start_in_kit, page: arg("--page"), chart: arg("--chart") };
-    let window = ui::window_settings(1.0).into_iter().find_map(|settings| {
+    let (w, h) = arg("--size")
+        .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+        .unwrap_or((800, 450));
+    let window = ui::window_settings(w, h).into_iter().find_map(|settings| {
         let (s, options) = (Arc::clone(&shared), options.clone());
         baseview::Window::create(settings, move |ctx| Editor::new(ctx, s, options)).ok()
     });
