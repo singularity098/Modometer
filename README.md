@@ -151,7 +151,7 @@ pace. Very slow, sparse playing will read a little low.
 
 Every push is built and tested by GitHub Actions. To get a build without compiling: open the
 repository's **Actions** tab, pick the latest **Build** run, and download the
-`Modometer-vst3-linux-…` artifact at the bottom. Unzip it and copy `Modometer.vst3` into
+`Modometer-<version>-linux-x86_64` artifact at the bottom. Unzip it and copy `Modometer.vst3` into
 `~/.vst3` (delete an older `Modometer.vst3`, or `MIDI-Counter.vst3` from before the rename, there, if any). It needs glibc 2.35 or newer (Ubuntu 22.04 and later, and most current distros).
 
 To build it yourself you need Rust (stable); X11 and OpenGL are loaded at run time.

@@ -1,5 +1,6 @@
 # Builds and tests the plugin on every push and pull request, and uploads
-# "Modometer.vst3" as a downloadable artifact of the run.
+# "Modometer.vst3" as a downloadable artifact of the run, named
+# Modometer-<version>-linux-x86_64 (<App>-<version>-<platform>-<architecture>).
 name: Build
 
 on:
@@ -24,9 +25,20 @@ jobs:
       - name: Build the VST3 bundle
         run: ./scripts/bundle.sh
 
+      - name: Version
+        id: version
+        # A v* tag's version, or the crate's and the commit for builds between releases.
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Upload the plugin
         uses: actions/upload-artifact@v4
         with:
-          name: Modometer-vst3-linux-${{ github.sha }}
+          name: Modometer-${{ steps.version.outputs.version }}-linux-x86_64
           path: target/bundle/
           if-no-files-found: error
